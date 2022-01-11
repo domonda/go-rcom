@@ -24,7 +24,7 @@ func main() {
 		if filename == "" {
 			continue
 		}
-		err := ioutil.WriteFile(filename, nil, 0660)
+		err := ioutil.WriteFile(filename, nil, 0600)
 		if err != nil {
 			panic(err)
 		}
