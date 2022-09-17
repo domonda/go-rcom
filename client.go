@@ -32,7 +32,7 @@ func (c *Client) ExecuteWithCommand(ctx context.Context, cmd string, cmdArgs []s
 		command.Files = make(map[string][]byte)
 
 		for _, file := range files {
-			data, err := file.ReadAll()
+			data, err := file.ReadAll(ctx)
 			if err != nil {
 				return nil, err
 			}

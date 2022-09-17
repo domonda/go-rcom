@@ -1,6 +1,7 @@
 package rcom
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/domonda/go-types/uu"
@@ -25,5 +26,5 @@ func (r *Result) WriteTo(output fs.File) error {
 	case len(rf) == 0:
 		return fmt.Errorf("empty result file: %s, callID=%v", output.Name(), r.CallID)
 	}
-	return output.WriteAll(rf)
+	return output.WriteAll(context.Background(), rf)
 }
