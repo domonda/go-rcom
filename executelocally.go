@@ -15,7 +15,7 @@ import (
 func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.ID, err error) {
 	start := time.Now()
 	// Every call gets a UUID
-	callID = uu.IDv4()
+	callID = uu.IDv7()
 
 	log := log.With().
 		UUID("callID", callID).

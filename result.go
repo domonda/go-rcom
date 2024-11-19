@@ -8,13 +8,13 @@ import (
 )
 
 type Result struct {
-	_        struct{}
 	CallID   uu.ID
 	ExitCode int
 	Output   string
 	Stdout   string
 	Stderr   string
 	Files    map[string][]byte
+	_        struct{}
 }
 
 func (r *Result) WriteTo(output fs.File) error {
