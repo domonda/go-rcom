@@ -11,7 +11,7 @@ import (
 	"github.com/ungerik/go-fs"
 )
 
-func cpCommand() (command *Command, expectedFile *fs.MemFile) {
+func cpCommand() (command *Command, expectedFile fs.MemFile) {
 	inputFile := fs.NewMemFile("input.txt", []byte("rcom test file"))
 	expectedFile = fs.NewMemFile("output.txt", []byte("rcom test file"))
 	command = &Command{

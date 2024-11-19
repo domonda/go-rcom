@@ -45,7 +45,7 @@ func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.
 
 	// Add files to working dir
 	for fileName, fileData := range c.Files {
-		err = dir.Join(fileName).WriteAll(ctx, fileData)
+		err = dir.Join(fileName).WriteAllContext(ctx, fileData)
 		if err != nil {
 			return nil, callID, fmt.Errorf("can't copy file %q because of error: %w", fileName, err)
 		}
@@ -83,7 +83,7 @@ func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.
 			if file.IsDir() {
 				return nil
 			}
-			data, err := file.ReadAll(ctx)
+			data, err := file.ReadAllContext(ctx)
 			if err != nil {
 				return err
 			}

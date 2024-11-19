@@ -1,7 +1,6 @@
 package rcom
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/domonda/go-types/uu"
@@ -9,13 +8,13 @@ import (
 )
 
 type Result struct {
+	_        struct{}
 	CallID   uu.ID
 	ExitCode int
 	Output   string
 	Stdout   string
 	Stderr   string
 	Files    map[string][]byte
-	_        struct{}
 }
 
 func (r *Result) WriteTo(output fs.File) error {
@@ -26,5 +25,5 @@ func (r *Result) WriteTo(output fs.File) error {
 	case len(rf) == 0:
 		return fmt.Errorf("empty result file: %s, callID=%v", output.Name(), r.CallID)
 	}
-	return output.WriteAll(context.Background(), rf)
+	return output.WriteAll(rf)
 }
