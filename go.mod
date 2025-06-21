@@ -5,10 +5,10 @@ go 1.23.0
 toolchain go1.24.3
 
 require (
-	github.com/domonda/go-types v0.0.0-20250527163512-252e849a39ce
-	github.com/domonda/golog v0.0.0-20250602132824-64373b1f2802
+	github.com/domonda/go-types v0.0.0-20250610070846-52067ab2d5ab
+	github.com/domonda/golog v0.0.0-20250620142312-a23446a321e4
 	github.com/stretchr/testify v1.10.0
-	github.com/ungerik/go-fs v0.0.0-20250527162931-1691110c1708
+	github.com/ungerik/go-fs v0.0.0-20250610091738-d3e54d2e9850
 )
 
 require (
@@ -17,11 +17,11 @@ require (
 	github.com/buger/jsonparser v1.1.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/domonda/go-encjson v0.0.0-20250402115751-77a50fd88c01 // indirect
-	github.com/domonda/go-errs v0.0.0-20250527162518-c9fdfcc032a1 // indirect
-	github.com/domonda/go-pretty v0.0.0-20240110134850-17385799142f // indirect
+	github.com/domonda/go-errs v0.0.0-20250603150208-71d6de0c48ea // indirect
+	github.com/domonda/go-pretty v0.0.0-20250602142956-1b467adc6387 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
-	github.com/kr/pretty v0.3.0 // indirect
+	github.com/kr/pretty v0.3.1 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/mailru/easyjson v0.9.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

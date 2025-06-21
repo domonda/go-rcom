@@ -10,7 +10,7 @@ import (
 var (
 	GracefulShutdownTimeout = time.Minute
 
-	log = rootlog.NewPackageLogger("rcom")
+	log = rootlog.NewPackageLogger()
 )
 
 // SetLogger changes the logger used by the package.
