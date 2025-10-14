@@ -11,6 +11,22 @@ import (
 	"time"
 )
 
+// ListenAndServe starts an HTTP server that accepts and executes remote commands.
+// The server only executes commands explicitly listed in allowedCMDs.
+//
+// Parameters:
+//   - port: The port number to listen on
+//   - gracefulShutdown: If true, enables graceful shutdown on SIGTERM/SIGINT/SIGHUP
+//   - allowedCMDs: Command names that are allowed to be executed
+//
+// The server receives gob-encoded Command structs via HTTP POST and returns
+// gob-encoded Result structs. Commands not in allowedCMDs are rejected with
+// HTTP 400 Bad Request.
+//
+// If gracefulShutdown is enabled, the server will:
+//   - Stop accepting new connections on receiving termination signals
+//   - Wait for in-flight requests to complete
+//   - Shutdown after GracefulShutdownTimeout if requests are still running
 func ListenAndServe(port uint16, gracefulShutdown bool, allowedCMDs ...string) error {
 	cmds := make(map[string]bool)
 	for _, cmd := range allowedCMDs {

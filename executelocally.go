@@ -12,6 +12,24 @@ import (
 	"github.com/ungerik/go-fs"
 )
 
+// ExecuteLocally executes a command locally in an isolated temporary directory.
+//
+// The function:
+//  1. Creates a unique temporary directory named with a UUID v7
+//  2. Writes all input files to the temporary directory
+//  3. Executes the command with the temp directory as working directory
+//  4. Provides stdin data if specified
+//  5. Collects stdout, stderr, and exit code
+//  6. Reads result files matching ResultFilePatterns
+//  7. Cleans up the temporary directory
+//
+// Returns:
+//   - result: The command result including output and files
+//   - callID: Unique UUID v7 identifier for this execution
+//   - err: Any error that occurred during execution
+//
+// Non-zero exit codes are treated as errors unless listed in Command.NonErrorExitCodes.
+// The command respects context cancellation and will terminate child processes.
 func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.ID, err error) {
 	start := time.Now()
 	// Every call gets a UUID
