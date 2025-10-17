@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 	"time"
@@ -24,7 +23,7 @@ func main() {
 		if filename == "" {
 			continue
 		}
-		err := ioutil.WriteFile(filename, nil, 0600)
+		err := os.WriteFile(filename, nil, 0644)
 		if err != nil {
 			panic(err)
 		}
