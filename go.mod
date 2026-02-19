@@ -15,8 +15,8 @@ require (
 	github.com/buger/jsonparser v1.1.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/domonda/go-encjson v0.0.0-20250402115751-77a50fd88c01 // indirect
-	github.com/domonda/go-errs v0.0.0-20251013161139-c89ca9c05d0a // indirect
-	github.com/domonda/go-pretty v0.0.0-20250602142956-1b467adc6387 // indirect
+	github.com/domonda/go-errs v1.0.0 // indirect
+	github.com/domonda/go-pretty v1.0.0 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
