@@ -106,15 +106,15 @@ func Test_serveUntilSignal(t *testing.T) {
 	}
 }
 
-func Test_serveUntilSignal_pipelinedData(t *testing.T) {
+// Server.Close does not close hijacked connections, so a forced shutdown
+// has to cancel the request of a client that stays connected
+func Test_serveUntilSignal_hijackedConnection(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses sleep")
 	}
 
 	addr, signals, started, finished, served := startSignaledServer(t, time.Millisecond)
 
-	// Send a request and one more byte after its body, which makes
-	// net/http stop watching the connection for being closed
 	body := bytes.NewBuffer(nil)
 	require.NoError(t, gob.NewEncoder(body).Encode(newWireCommand(&Command{Name: "sleep", Args: []string{"30"}})))
 	conn, err := net.Dial("tcp", strings.TrimPrefix(addr, "http://"))
@@ -123,8 +123,6 @@ func Test_serveUntilSignal_pipelinedData(t *testing.T) {
 	_, err = fmt.Fprintf(conn, "POST / HTTP/1.1\r\nHost: rcom\r\nContent-Length: %d\r\n\r\n%s", body.Len(), body.Bytes())
 	require.NoError(t, err)
 	<-started
-	_, err = conn.Write([]byte("X"))
-	require.NoError(t, err)
 	signals <- syscall.SIGTERM
 
 	assert.ErrorIs(t, <-served, context.DeadlineExceeded)
