@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"testing"
@@ -188,6 +189,52 @@ func Test_service_limits(t *testing.T) {
 		svc.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/", encodeRequest(t, command)))
 		assert.Equal(t, http.StatusBadRequest, response.Code)
 		assert.Contains(t, response.Body.String(), "path separators")
+	})
+
+	t.Run("rejected while shutting down", func(t *testing.T) {
+		svc := &service{
+			allowedCMDs:  map[string]bool{copyCmd(): true},
+			running:      make(chan struct{}, 1),
+			shuttingDown: make(chan struct{}),
+		}
+		svc.running <- struct{}{} // Another command is running
+		svc.shutdown()
+		command, _ := cpCommand()
+
+		response := httptest.NewRecorder()
+		svc.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/", encodeRequest(t, command)))
+		assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+		assert.Contains(t, response.Body.String(), "shutting down")
+	})
+
+	t.Run("data after the command", func(t *testing.T) {
+		svc := &service{allowedCMDs: map[string]bool{copyCmd(): true}}
+		command, _ := cpCommand()
+		body := encodeRequest(t, command)
+		body.Write(make([]byte, 64<<10))
+
+		response := httptest.NewRecorder()
+		svc.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/", body))
+		assert.Equal(t, http.StatusBadRequest, response.Code)
+		assert.Contains(t, response.Body.String(), "unexpected data after the command")
+	})
+
+	t.Run("file names differing in case", func(t *testing.T) {
+		// Detect if the temp dir file system ignores case
+		probe := filepath.Join(t.TempDir(), "CASE")
+		require.NoError(t, os.WriteFile(probe, nil, 0o600))
+		if _, err := os.Stat(filepath.Join(filepath.Dir(probe), "case")); err != nil {
+			t.Skip("case-sensitive file system")
+		}
+
+		svc := &service{allowedCMDs: map[string]bool{copyCmd(): true}}
+		command, _ := cpCommand()
+		command.Files["A.txt"] = nil
+		command.Files["a.txt"] = nil
+
+		response := httptest.NewRecorder()
+		svc.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/", encodeRequest(t, command)))
+		assert.Equal(t, http.StatusBadRequest, response.Code)
 	})
 
 	t.Run("invalid request body", func(t *testing.T) {

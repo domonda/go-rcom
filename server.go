@@ -1,10 +1,12 @@
 package rcom
 
 import (
+	"bufio"
 	"context"
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -37,12 +39,14 @@ import (
 //   - Cancel requests still running after GracefulShutdownTimeout,
 //     or when a second signal is received, and return the shutdown error
 func ListenAndServe(port uint16, gracefulShutdown bool, allowedCMDs ...string) error {
+	svc := newService(allowedCMDs)
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),
-		Handler:           newService(allowedCMDs),
+		Handler:           svc,
 		ReadHeaderTimeout: serverReadHeaderTimeout,
 		IdleTimeout:       serverIdleTimeout,
 	}
+	server.RegisterOnShutdown(svc.shutdown)
 	if !gracefulShutdown {
 		return server.ListenAndServe()
 	}
@@ -142,12 +146,22 @@ type service struct {
 	// running limits the number of concurrently executed
 	// commands to its capacity if not nil
 	running chan struct{}
+
+	// shuttingDown is closed by shutdown
+	shuttingDown chan struct{}
+	shutdownOnce sync.Once
+}
+
+// shutdown rejects requests waiting for a command slot
+func (s *service) shutdown() {
+	s.shutdownOnce.Do(func() { close(s.shuttingDown) })
 }
 
 func newService(allowedCMDs []string) *service {
 	s := &service{
 		allowedCMDs:    make(map[string]bool),
 		maxRequestSize: MaxRequestSize,
+		shuttingDown:   make(chan struct{}),
 	}
 	for _, cmd := range allowedCMDs {
 		s.allowedCMDs[cmd] = true
@@ -166,7 +180,18 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var command *Command
-	err := gob.NewDecoder(r.Body).Decode(&command)
+	body := bufio.NewReader(r.Body)
+	err := gob.NewDecoder(body).Decode(&command)
+	if err == nil {
+		// The request body must end after the command because
+		// the server cancels the requests of closed connections
+		// only after their body has been read completely
+		if _, err = body.Peek(1); err == nil {
+			err = errors.New("rcom.Command: unexpected data after the command")
+		} else if err == io.EOF {
+			err = nil
+		}
+	}
 	if err != nil {
 		log.Error("can't decode command request").
 			Err(err).
@@ -190,8 +215,14 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, callID, err := s.execute(r.Context(), command)
-	if errors.Is(err, errWaitingForCommandSlot) {
+	if errors.Is(err, errNoCommandSlot) {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	if errors.Is(err, os.ErrExist) {
+		// Input file names that differ only in case
+		// on a case-insensitive file system
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if err != nil {
@@ -214,21 +245,24 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// errWaitingForCommandSlot is returned by service.execute if the
-// request was canceled while waiting for a free command slot
-var errWaitingForCommandSlot = errors.New("request canceled while waiting for running commands")
+// errNoCommandSlot is returned by service.execute if the request
+// was canceled or the server shut down while waiting for a free command slot
+var errNoCommandSlot = errors.New("no free slot for running commands")
 
 // execute executes the command locally. If the number of concurrent
 // commands is limited, it waits for a free slot and releases it when
 // the command has finished, before the result is sent to the client,
 // so that a client reading slowly does not block other commands.
+// Waiting requests are rejected when the server shuts down.
 func (s *service) execute(ctx context.Context, command *Command) (*Result, uu.ID, error) {
 	if s.running != nil {
 		select {
 		case s.running <- struct{}{}:
 			defer func() { <-s.running }()
 		case <-ctx.Done():
-			return nil, uu.IDNil, errWaitingForCommandSlot
+			return nil, uu.IDNil, fmt.Errorf("%w: request canceled while waiting", errNoCommandSlot)
+		case <-s.shuttingDown:
+			return nil, uu.IDNil, fmt.Errorf("%w: server is shutting down", errNoCommandSlot)
 		}
 	}
 	log.Infof("Executing command: %s", command).Log()
