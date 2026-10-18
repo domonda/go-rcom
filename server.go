@@ -144,6 +144,11 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("command %q not allowed", command.Name), http.StatusBadRequest)
 		return
 	}
+	err = command.Validate()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	if s.running != nil {
 		select {

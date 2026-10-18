@@ -148,6 +148,17 @@ func Test_service_limits(t *testing.T) {
 		assert.Empty(t, svc.running, "slot is released")
 	})
 
+	t.Run("invalid command", func(t *testing.T) {
+		svc := &service{allowedCMDs: map[string]bool{copyCmd(): true}}
+		command, _ := cpCommand()
+		command.Files["..%2Fescaped.txt"] = nil
+
+		response := httptest.NewRecorder()
+		svc.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/", encodeRequest(t, command)))
+		assert.Equal(t, http.StatusBadRequest, response.Code)
+		assert.Contains(t, response.Body.String(), "path separators")
+	})
+
 	t.Run("invalid request body", func(t *testing.T) {
 		response := httptest.NewRecorder()
 		(&service{}).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString("not gob")))
