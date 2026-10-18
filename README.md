@@ -351,6 +351,10 @@ Each command execution gets a unique temporary directory:
 5. **Input Validation**: Commands are validated before execution
 6. **No Authentication**: The server accepts requests from anyone who can reach
    its port over plain HTTP. Run it in a private network or behind an authenticating proxy
+7. **Untrusted Requests**: Requests are gob-decoded before the command name is checked,
+   and gob can allocate much more memory than a request's size.
+   `MaxRequestSize` and `MaxConcurrentCommands` do not bound memory use
+   against malicious clients, and commands have no time or output size limit
 
 ## Error Handling
 
