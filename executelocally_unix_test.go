@@ -110,6 +110,23 @@ func Test_ExecuteLocally_InheritedEnvVars(t *testing.T) {
 	assert.True(t, strings.HasPrefix(result.Stdout, "secret:"), "nil inherits all variables")
 }
 
+func Test_ExecuteLocally_Env(t *testing.T) {
+	t.Setenv("LANG", "inherited")
+	command := &Command{
+		Name: "sh",
+		Args: []string{"-c", `printf '%s:%s' "$RCOM_TEST_ENV" "$LANG"`},
+		Env:  map[string]string{"RCOM_TEST_ENV": "value", "LANG": "C"},
+	}
+	result, _, err := ExecuteLocally(context.Background(), command)
+	require.NoError(t, err)
+	assert.Equal(t, "value:C", result.Stdout, "Env is set and replaces inherited variables")
+
+	setVar(t, &InheritedEnvVars, nil)
+	result, _, err = ExecuteLocally(context.Background(), command)
+	require.NoError(t, err)
+	assert.Equal(t, "value:C", result.Stdout, "also when inheriting all variables")
+}
+
 func Test_ExecuteLocally_permissions(t *testing.T) {
 	command, _ := cpCommand()
 	command.Name = "ls"

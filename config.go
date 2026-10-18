@@ -80,6 +80,14 @@ var (
 		"PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
 	}
 
+	// AllowedCommandEnvVars are the names of the Command.Env variables
+	// that clients may set for commands executed by ListenAndServe.
+	// Names are case-insensitive on Windows.
+	// Allowing variables like LD_PRELOAD would let clients run any code.
+	AllowedCommandEnvVars = []string{
+		"OMP_THREAD_LIMIT", "OMP_NUM_THREADS", "MAGICK_THREAD_LIMIT", "TZ", "LANG", "LC_ALL",
+	}
+
 	log = rootlog.NewPackageLogger()
 )
 

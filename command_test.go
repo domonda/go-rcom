@@ -106,5 +106,12 @@ func Test_Command_Validate(t *testing.T) {
 		assert.Error(t, command.Validate(), name)
 	}
 
+	for _, name := range []string{"", "A=B", "NUL\x00"} {
+		command := &Command{Name: copyCmd(), Env: map[string]string{name: "value"}}
+		assert.Error(t, command.Validate(), "environment variable %q", name)
+	}
+	assert.Error(t, (&Command{Name: copyCmd(), Env: map[string]string{"A": "NUL\x00"}}).Validate(), "NUL in value")
+	assert.NoError(t, (&Command{Name: copyCmd(), Env: map[string]string{"A": "a=b"}}).Validate())
+
 	assert.Error(t, (&Command{}).Validate(), "no command name")
 }

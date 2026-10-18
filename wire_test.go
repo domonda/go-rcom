@@ -18,6 +18,7 @@ func Test_wireCommand(t *testing.T) {
 		Name:               "convert",
 		Args:               []string{"in.png", "out.jpg"},
 		Stdin:              []byte("stdin"),
+		Env:                map[string]string{"OMP_THREAD_LIMIT": "1", "EMPTY": "", "WITH_EQUALS": "a=b"},
 		Files:              map[string][]byte{"in.png": []byte("png"), "b.txt": []byte("b"), "empty.txt": nil},
 		ResultFilePatterns: []string{"*.jpg"},
 		NonErrorExitCodes:  map[int]bool{1: true, 3: true},
@@ -68,6 +69,12 @@ func Test_readWireCommand_limits(t *testing.T) {
 		stream := encodeGob(t, &wireCommandHeader{Name: "x", NumFiles: 2}, &wireFile{Name: "a"}, &wireFile{Name: "a"})
 		_, err := readWireCommand(bufio.NewReader(stream))
 		assert.ErrorContains(t, err, `duplicate file name "a"`)
+	})
+
+	t.Run("duplicate environment variables", func(t *testing.T) {
+		stream := encodeGob(t, &wireCommandHeader{Name: "x", Env: []string{"A=1", "A=2"}})
+		_, err := readWireCommand(bufio.NewReader(stream))
+		assert.ErrorContains(t, err, `duplicate environment variable "A"`)
 	})
 
 	t.Run("too many files", func(t *testing.T) {

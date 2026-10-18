@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -92,7 +93,7 @@ func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.
 
 	r, err := exec.Command(c.Name, c.Args...).
 		WithDir(dirPath).
-		WithEnv(commandEnv()).
+		WithEnv(commandEnv(c.Env)).
 		WithStdin(stdin).
 		WithKillSubProcesses().
 		WithWaitDelay(commandWaitDelay).
@@ -143,25 +144,36 @@ const (
 )
 
 // commandEnv returns the process environment with only the InheritedEnvVars,
-// or nil to inherit all variables if InheritedEnvVars is nil
-func commandEnv() []string {
-	if InheritedEnvVars == nil {
+// or all variables if InheritedEnvVars is nil, followed by the variables of env.
+// It returns nil, which inherits all variables, if InheritedEnvVars is nil
+// and env is empty.
+func commandEnv(env map[string]string) []string {
+	if InheritedEnvVars == nil && len(env) == 0 {
 		return nil
 	}
-	env := []string{} // Not nil, which would inherit all variables
+	result := []string{} // Not nil, which would inherit all variables
 	for _, nameValue := range os.Environ() {
 		name, _, _ := strings.Cut(nameValue, "=")
-		inherited := slices.ContainsFunc(InheritedEnvVars, func(inherited string) bool {
-			if runtime.GOOS == "windows" {
-				return strings.EqualFold(inherited, name)
-			}
-			return inherited == name
-		})
-		if inherited {
-			env = append(env, nameValue)
+		if InheritedEnvVars == nil || envVarIn(InheritedEnvVars, name) {
+			result = append(result, nameValue)
 		}
 	}
-	return env
+	// Later variables replace earlier ones with the same name
+	names := slices.Sorted(maps.Keys(env))
+	for _, name := range names {
+		result = append(result, name+"="+env[name])
+	}
+	return result
+}
+
+// envVarIn returns if name is in names, case-insensitive on Windows
+func envVarIn(names []string, name string) bool {
+	return slices.ContainsFunc(names, func(n string) bool {
+		if runtime.GOOS == "windows" {
+			return strings.EqualFold(n, name)
+		}
+		return n == name
+	})
 }
 
 // outputTail returns the last maxErrorOutputSize bytes of output

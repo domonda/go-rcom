@@ -36,6 +36,7 @@ var errWireMessageTooLarge = errors.New("rcom: message too large")
 type wireCommandHeader struct {
 	Name               string
 	Args               []string
+	Env                []string // NAME=value
 	ResultFilePatterns []string
 	NonErrorExitCodes  []int
 	HasStdin           bool
@@ -75,6 +76,10 @@ func writeWireCommand(w io.Writer, c *Command) error {
 		}
 	}
 	slices.Sort(header.NonErrorExitCodes)
+	for name, value := range c.Env {
+		header.Env = append(header.Env, name+"="+value)
+	}
+	slices.Sort(header.Env)
 
 	enc := gob.NewEncoder(w)
 	err := enc.Encode(&header)
@@ -112,6 +117,16 @@ func readWireCommand(r *bufio.Reader) (*Command, error) {
 		c.NonErrorExitCodes = make(map[int]bool, len(header.NonErrorExitCodes))
 		for _, code := range header.NonErrorExitCodes {
 			c.NonErrorExitCodes[code] = true
+		}
+	}
+	if len(header.Env) > 0 {
+		c.Env = make(map[string]string, len(header.Env))
+		for _, nameValue := range header.Env {
+			name, value, _ := strings.Cut(nameValue, "=")
+			if _, exists := c.Env[name]; exists {
+				return nil, fmt.Errorf("rcom.Command: duplicate environment variable %q", limitString(name, maxErrorStringLength))
+			}
+			c.Env[name] = value
 		}
 	}
 

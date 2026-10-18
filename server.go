@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -33,6 +34,9 @@ import (
 // The server receives gob-encoded Command structs via HTTP POST and returns
 // gob-encoded Result structs. Commands not in allowedCMDs, invalid commands
 // and requests with data after the Command are rejected with HTTP 400 Bad Request.
+//
+// Commands with Command.Env variables not in AllowedCommandEnvVars
+// are rejected with HTTP 400 Bad Request.
 //
 // The server applies MaxRequestSize, MaxConcurrentCommands,
 // MaxCommandDuration, MaxConnections and StallTimeout
@@ -213,6 +217,9 @@ const (
 type service struct {
 	allowedCMDs map[string]bool
 
+	// allowedEnvVars are the names of variables commands may set
+	allowedEnvVars []string
+
 	// maxRequestSize limits the request size if greater than zero
 	maxRequestSize int64
 
@@ -246,6 +253,7 @@ func (s *service) shutdown() {
 func newService(allowedCMDs []string) *service {
 	s := &service{
 		allowedCMDs:        make(map[string]bool),
+		allowedEnvVars:     slices.Clone(AllowedCommandEnvVars),
 		maxRequestSize:     MaxRequestSize,
 		maxCommandDuration: MaxCommandDuration,
 		stallTimeout:       StallTimeout,
@@ -365,6 +373,11 @@ func (s *service) readCommand(ctx context.Context, w http.ResponseWriter, r *htt
 
 	if !s.allowedCMDs[command.Name] {
 		return nil, http.StatusBadRequest, fmt.Errorf("command %q not allowed", limitString(command.Name, maxErrorStringLength))
+	}
+	for name := range command.Env {
+		if !envVarIn(s.allowedEnvVars, name) {
+			return nil, http.StatusBadRequest, fmt.Errorf("environment variable %q not allowed", limitString(name, maxErrorStringLength))
+		}
 	}
 	err = command.Validate()
 	if err != nil {

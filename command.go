@@ -40,6 +40,12 @@ type Command struct {
 	// Stdin provides data to be written to the command's standard input.
 	Stdin []byte
 
+	// Env are environment variables (name to value) set for the command
+	// in addition to the InheritedEnvVars of the executing process.
+	// ListenAndServe only executes commands with variables
+	// listed in AllowedCommandEnvVars.
+	Env map[string]string
+
 	// Files are input files to be written to the command's working directory.
 	// Map keys are filenames (cannot contain path separators), values are file contents.
 	Files map[string][]byte
@@ -63,6 +69,8 @@ type Command struct {
 //   - Name is empty
 //   - Any filename is empty, "." or "..", longer than 255 bytes,
 //     or contains NUL or path separators, also in URL-encoded form like "%2F"
+//   - Any environment variable name is empty or contains "=" or NUL,
+//     or its value contains NUL
 //   - Any result file pattern is empty, duplicated or malformed
 func (c *Command) Validate() error {
 	if c.Name == "" {
@@ -72,6 +80,11 @@ func (c *Command) Validate() error {
 		err := validateFileName(fileName)
 		if err != nil {
 			return err
+		}
+	}
+	for name, value := range c.Env {
+		if name == "" || strings.ContainsAny(name, "=\x00") || strings.ContainsRune(value, 0) {
+			return fmt.Errorf("rcom.Command: invalid environment variable %q", limitString(name, maxErrorStringLength))
 		}
 	}
 	patterns := make(map[string]bool)
