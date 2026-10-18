@@ -32,7 +32,7 @@ const maxErrorResponseSize = 128 << 10
 //   - Command validation fails
 //   - Network request fails
 //   - Server returns non-200 status (e.g., command not allowed),
-//     the error contains the server's error message
+//     as *ResponseError with the server's error message
 //   - Response decoding fails
 //
 // The server must be running ListenAndServe with the command allowed.
@@ -74,8 +74,24 @@ func ExecuteRemotely(ctx context.Context, addr string, c *Command) (result *Resu
 	if response.StatusCode != http.StatusOK {
 		// The server responds with an error message
 		message, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorResponseSize))
-		return nil, fmt.Errorf("rcom.Command: response status %s: %s", response.Status, bytes.TrimSpace(message))
+		return nil, &ResponseError{
+			StatusCode: response.StatusCode,
+			Status:     response.Status,
+			Message:    string(bytes.TrimSpace(message)),
+		}
 	}
 
 	return readWireResult(response.Body)
+}
+
+// ResponseError is returned by ExecuteRemotely
+// if the server responded with an error status
+type ResponseError struct {
+	StatusCode int    // For example 500
+	Status     string // For example "500 Internal Server Error"
+	Message    string // The error message of the server
+}
+
+func (e *ResponseError) Error() string {
+	return fmt.Sprintf("rcom.Command: response status %s: %s", e.Status, e.Message)
 }

@@ -34,18 +34,38 @@ type Result struct {
 	_ struct{}
 }
 
+// FileData returns the data of the named result file.
+// Returns an error if the result file doesn't exist or is empty.
+func (r *Result) FileData(name string) ([]byte, error) {
+	// An empty file has a nil value after gob decoding,
+	// so the key has to be checked for existence
+	data, ok := r.Files[name]
+	switch {
+	case !ok:
+		return nil, fmt.Errorf("no result file: %s, callID=%v", name, r.CallID)
+	case len(data) == 0:
+		return nil, fmt.Errorf("empty result file: %s, callID=%v", name, r.CallID)
+	}
+	return data, nil
+}
+
+// MemFile returns the named result file as fs.MemFile.
+// Returns an error if the result file doesn't exist or is empty.
+func (r *Result) MemFile(name string) (fs.MemFile, error) {
+	data, err := r.FileData(name)
+	if err != nil {
+		return fs.MemFile{}, err
+	}
+	return fs.NewMemFile(name, data), nil
+}
+
 // WriteTo writes a result file to the specified output file.
 // Returns an error if the result file doesn't exist or is empty.
 // The file is identified by matching output.Name() against Files keys.
 func (r *Result) WriteTo(output fs.File) error {
-	// An empty file has a nil value after gob decoding,
-	// so the key has to be checked for existence
-	rf, ok := r.Files[output.Name()]
-	switch {
-	case !ok:
-		return fmt.Errorf("no result file: %s, callID=%v", output.Name(), r.CallID)
-	case len(rf) == 0:
-		return fmt.Errorf("empty result file: %s, callID=%v", output.Name(), r.CallID)
+	data, err := r.FileData(output.Name())
+	if err != nil {
+		return err
 	}
-	return output.WriteAll(rf)
+	return output.WriteAll(data)
 }

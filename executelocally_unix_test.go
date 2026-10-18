@@ -16,14 +16,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// setVar sets a package variable for the duration of the test
-func setVar[T any](t *testing.T, variable *T, value T) {
-	t.Helper()
-	previous := *variable
-	*variable = value
-	t.Cleanup(func() { *variable = previous })
-}
-
 func Test_ExecuteLocally_MaxOutputSize(t *testing.T) {
 	setVar(t, &MaxOutputSize, 1<<20)
 

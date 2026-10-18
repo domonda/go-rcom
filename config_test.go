@@ -25,3 +25,11 @@ func Test_SetLogger_nil(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, expectedFile.FileData, result.Files[expectedFile.Name()])
 }
+
+// setVar sets a package variable for the duration of the test
+func setVar[T any](t *testing.T, variable *T, value T) {
+	t.Helper()
+	previous := *variable
+	*variable = value
+	t.Cleanup(func() { *variable = previous })
+}

@@ -51,3 +51,16 @@ func Test_Result_WriteTo(t *testing.T) {
 		}
 	})
 }
+
+func Test_Result_MemFile(t *testing.T) {
+	result := &Result{Files: map[string][]byte{"output.txt": []byte("result"), "empty.txt": nil}}
+
+	file, err := result.MemFile("output.txt")
+	require.NoError(t, err)
+	assert.Equal(t, fs.NewMemFile("output.txt", []byte("result")), file)
+
+	_, err = result.MemFile("empty.txt")
+	assert.ErrorContains(t, err, "empty result file")
+	_, err = result.FileData("missing.txt")
+	assert.ErrorContains(t, err, "no result file")
+}
