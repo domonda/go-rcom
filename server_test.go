@@ -3,7 +3,6 @@ package rcom
 import (
 	"bytes"
 	"context"
-	"encoding/gob"
 	"fmt"
 	"net"
 	"net/http"
@@ -116,7 +115,7 @@ func Test_serveUntilSignal_hijackedConnection(t *testing.T) {
 	addr, signals, started, finished, served := startSignaledServer(t, time.Millisecond)
 
 	body := bytes.NewBuffer(nil)
-	require.NoError(t, gob.NewEncoder(body).Encode(newWireCommand(&Command{Name: "sleep", Args: []string{"30"}})))
+	require.NoError(t, writeWireCommand(body, &Command{Name: "sleep", Args: []string{"30"}}))
 	conn, err := net.Dial("tcp", strings.TrimPrefix(addr, "http://"))
 	require.NoError(t, err)
 	defer conn.Close()
@@ -176,7 +175,7 @@ func Test_service_limits(t *testing.T) {
 	encodeRequest := func(t *testing.T, command *Command) *bytes.Buffer {
 		t.Helper()
 		body := bytes.NewBuffer(nil)
-		require.NoError(t, gob.NewEncoder(body).Encode(newWireCommand(command)))
+		require.NoError(t, writeWireCommand(body, command))
 		return body
 	}
 

@@ -5,7 +5,6 @@ package rcom
 import (
 	"bufio"
 	"bytes"
-	"encoding/gob"
 	"fmt"
 	"io"
 	"net"
@@ -37,7 +36,7 @@ func startObservedServer(t *testing.T, svc *service) (addr string, finished chan
 func sendRawRequest(t *testing.T, addr string, command *Command) net.Conn {
 	t.Helper()
 	body := bytes.NewBuffer(nil)
-	require.NoError(t, gob.NewEncoder(body).Encode(newWireCommand(command)))
+	require.NoError(t, writeWireCommand(body, command))
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
 	t.Cleanup(func() { conn.Close() })
@@ -125,7 +124,7 @@ func Test_service_hijackedResponse(t *testing.T) {
 	assert.Equal(t, http.StatusOK, response.StatusCode)
 	assert.True(t, response.Close, "Connection: close")
 
-	var wire wireResult
-	require.NoError(t, gob.NewDecoder(response.Body).Decode(&wire))
-	assert.Equal(t, "hello\n", wire.Stdout)
+	result, err := readWireResult(response.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "hello\n", result.Stdout)
 }

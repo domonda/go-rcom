@@ -1,9 +1,9 @@
 package rcom
 
 import (
+	"bufio"
 	"bytes"
 	"context"
-	"encoding/gob"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -27,15 +27,12 @@ func cpCommand() (command *Command, expectedFile fs.MemFile) {
 func Test_GobCommand(t *testing.T) {
 	buf := bytes.NewBuffer(nil)
 
-	// Commands are sent as wireCommand
+	// Commands are sent as a gob stream
 	encoded, _ := cpCommand()
-	err := gob.NewEncoder(buf).Encode(newWireCommand(encoded))
+	err := writeWireCommand(buf, encoded)
 	assert.NoError(t, err)
 
-	var wire wireCommand
-	err = gob.NewDecoder(buf).Decode(&wire)
-	assert.NoError(t, err)
-	decoded, err := wire.command()
+	decoded, err := readWireCommand(bufio.NewReader(buf))
 	assert.NoError(t, err)
 
 	assert.Equal(t, encoded, decoded)

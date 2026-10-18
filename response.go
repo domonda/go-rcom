@@ -3,7 +3,6 @@ package rcom
 import (
 	"bufio"
 	"context"
-	"encoding/gob"
 	"fmt"
 	"io"
 	"net"
@@ -58,7 +57,7 @@ func (resp *response) error(status int, message string) {
 
 func (resp *response) result(result *Result) error {
 	encode := func(w io.Writer) error {
-		return gob.NewEncoder(w).Encode(newWireResult(result))
+		return writeWireResult(w, result)
 	}
 	if resp.conn == nil {
 		controller := http.NewResponseController(resp.w)

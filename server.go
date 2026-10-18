@@ -3,7 +3,6 @@ package rcom
 import (
 	"bufio"
 	"context"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
@@ -264,8 +263,7 @@ func (s *service) readCommand(w http.ResponseWriter, r *http.Request) (command *
 	controller := http.NewResponseController(w)
 	body := bufio.NewReader(&stallReader{r: r.Body, setDeadline: controller.SetReadDeadline, timeout: s.stallTimeout})
 
-	var wire wireCommand
-	err = gob.NewDecoder(body).Decode(&wire)
+	command, err = readWireCommand(body)
 	if err == nil {
 		// The request body must end after the command because
 		// the server cancels the requests of closed connections
@@ -291,12 +289,8 @@ func (s *service) readCommand(w http.ResponseWriter, r *http.Request) (command *
 	// The body has been read completely
 	_ = controller.SetReadDeadline(time.Time{})
 
-	command, err = wire.command()
-	if err != nil {
-		return nil, http.StatusBadRequest, err
-	}
 	if !s.allowedCMDs[command.Name] {
-		return nil, http.StatusBadRequest, fmt.Errorf("command %q not allowed", command.Name)
+		return nil, http.StatusBadRequest, fmt.Errorf("command %q not allowed", limitString(command.Name, maxErrorStringLength))
 	}
 	err = command.Validate()
 	if err != nil {

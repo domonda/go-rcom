@@ -1,131 +1,243 @@
 package rcom
 
 import (
+	"bufio"
+	"encoding/gob"
+	"errors"
 	"fmt"
+	"io"
+	"math"
 	"slices"
 	"strings"
 
 	"github.com/domonda/go-types/uu"
 )
 
-// The gob wire types use slices instead of the maps of Command and Result
-// because gob allocates a map from the entry count a message declares,
-// before reading any entry, so a request of a few hundred bytes could
-// allocate hundreds of MiB. Gob allocates slices in chunks that grow
-// with the data actually received.
+// Commands and results are sent as a stream of gob messages:
+// a header, for a command its stdin, and then one message per file.
+//
+// Gob allocates decoded values ahead of the data: a map from the entry
+// count a message declares, a slice element of up to 40 bytes for every
+// byte of an empty element. A request of a few bytes per element could
+// make the server allocate 40 to 80 times its size, or hundreds of MiB
+// with maps. So the header, which holds the slices, is limited to
+// maxWireHeaderSize, and every file is its own message.
+
+const (
+	// maxWireHeaderSize is the maximum size of a command header message
+	maxWireHeaderSize = 1 << 20
+
+	// maxWireFiles is the maximum number of files of a command or result
+	maxWireFiles = 10000
+)
+
+var errWireMessageTooLarge = errors.New("rcom: message too large")
+
+type wireCommandHeader struct {
+	Name               string
+	Args               []string
+	ResultFilePatterns []string
+	NonErrorExitCodes  []int
+	HasStdin           bool
+	NumFiles           int
+}
+
+type wireStdin struct {
+	Data []byte
+}
 
 type wireFile struct {
 	Name string
 	Data []byte
 }
 
-type wireCommand struct {
-	Name               string
-	Args               []string
-	Stdin              []byte
-	Files              []wireFile
-	ResultFilePatterns []string
-	NonErrorExitCodes  []int
-}
-
-type wireResult struct {
+type wireResultHeader struct {
 	CallID   uu.ID
 	ExitCode int
 	Output   string
 	Stdout   string
 	Stderr   string
-	Files    []wireFile
+	NumFiles int
 }
 
-func newWireCommand(c *Command) *wireCommand {
-	w := &wireCommand{
+// writeWireCommand writes the command as a gob stream to w
+func writeWireCommand(w io.Writer, c *Command) error {
+	header := wireCommandHeader{
 		Name:               c.Name,
 		Args:               c.Args,
-		Stdin:              c.Stdin,
-		Files:              newWireFiles(c.Files),
 		ResultFilePatterns: c.ResultFilePatterns,
+		HasStdin:           len(c.Stdin) > 0,
+		NumFiles:           len(c.Files),
 	}
 	for code, nonError := range c.NonErrorExitCodes {
 		if nonError {
-			w.NonErrorExitCodes = append(w.NonErrorExitCodes, code)
+			header.NonErrorExitCodes = append(header.NonErrorExitCodes, code)
 		}
 	}
-	slices.Sort(w.NonErrorExitCodes)
-	return w
+	slices.Sort(header.NonErrorExitCodes)
+
+	enc := gob.NewEncoder(w)
+	err := enc.Encode(&header)
+	if err != nil {
+		return err
+	}
+	if header.HasStdin {
+		err = enc.Encode(&wireStdin{Data: c.Stdin})
+		if err != nil {
+			return err
+		}
+	}
+	return writeWireFiles(enc, c.Files)
 }
 
-func (w *wireCommand) command() (*Command, error) {
-	files, err := wireFilesMap(w.Files)
+// readWireCommand reads a command written by writeWireCommand from r.
+// The caller limits the total size of the stream.
+func readWireCommand(r *bufio.Reader) (*Command, error) {
+	budget := &budgetReader{r: r, n: maxWireHeaderSize}
+	dec := gob.NewDecoder(budget)
+	var header wireCommandHeader
+	err := dec.Decode(&header)
 	if err != nil {
-		return nil, fmt.Errorf("rcom.Command: %w", err)
+		return nil, err
+	}
+	if header.NumFiles < 0 || header.NumFiles > maxWireFiles {
+		return nil, fmt.Errorf("rcom.Command: %d files, the maximum is %d", header.NumFiles, maxWireFiles)
 	}
 	c := &Command{
-		Name:               w.Name,
-		Args:               w.Args,
-		Stdin:              w.Stdin,
-		Files:              files,
-		ResultFilePatterns: w.ResultFilePatterns,
+		Name:               header.Name,
+		Args:               header.Args,
+		ResultFilePatterns: header.ResultFilePatterns,
 	}
-	if len(w.NonErrorExitCodes) > 0 {
-		c.NonErrorExitCodes = make(map[int]bool, len(w.NonErrorExitCodes))
-		for _, code := range w.NonErrorExitCodes {
+	if len(header.NonErrorExitCodes) > 0 {
+		c.NonErrorExitCodes = make(map[int]bool, len(header.NonErrorExitCodes))
+		for _, code := range header.NonErrorExitCodes {
 			c.NonErrorExitCodes[code] = true
 		}
+	}
+
+	// Stdin and files are allocated as their data arrives
+	budget.n = math.MaxInt64
+	if header.HasStdin {
+		var stdin wireStdin
+		err = dec.Decode(&stdin)
+		if err != nil {
+			return nil, err
+		}
+		c.Stdin = stdin.Data
+	}
+	c.Files, err = readWireFiles(dec, header.NumFiles)
+	if err != nil {
+		return nil, fmt.Errorf("rcom.Command: %w", err)
 	}
 	return c, nil
 }
 
-func newWireResult(r *Result) *wireResult {
-	return &wireResult{
+// writeWireResult writes the result as a gob stream to w
+func writeWireResult(w io.Writer, r *Result) error {
+	enc := gob.NewEncoder(w)
+	err := enc.Encode(&wireResultHeader{
 		CallID:   r.CallID,
 		ExitCode: r.ExitCode,
 		Output:   r.Output,
 		Stdout:   r.Stdout,
 		Stderr:   r.Stderr,
-		Files:    newWireFiles(r.Files),
+		NumFiles: len(r.Files),
+	})
+	if err != nil {
+		return err
 	}
+	return writeWireFiles(enc, r.Files)
 }
 
-func (w *wireResult) result() (*Result, error) {
-	files, err := wireFilesMap(w.Files)
+// readWireResult reads a result written by writeWireResult from r
+func readWireResult(r io.Reader) (*Result, error) {
+	dec := gob.NewDecoder(r)
+	var header wireResultHeader
+	err := dec.Decode(&header)
+	if err != nil {
+		return nil, err
+	}
+	if header.NumFiles < 0 || header.NumFiles > maxWireFiles {
+		return nil, fmt.Errorf("rcom.Result: %d files, the maximum is %d", header.NumFiles, maxWireFiles)
+	}
+	files, err := readWireFiles(dec, header.NumFiles)
 	if err != nil {
 		return nil, fmt.Errorf("rcom.Result: %w", err)
 	}
 	return &Result{
-		CallID:   w.CallID,
-		ExitCode: w.ExitCode,
-		Output:   w.Output,
-		Stdout:   w.Stdout,
-		Stderr:   w.Stderr,
+		CallID:   header.CallID,
+		ExitCode: header.ExitCode,
+		Output:   header.Output,
+		Stdout:   header.Stdout,
+		Stderr:   header.Stderr,
 		Files:    files,
 	}, nil
 }
 
-// newWireFiles returns the files sorted by name
-func newWireFiles(files map[string][]byte) []wireFile {
-	if len(files) == 0 {
-		return nil
+// writeWireFiles writes the files sorted by name
+func writeWireFiles(enc *gob.Encoder, files map[string][]byte) error {
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
 	}
-	wireFiles := make([]wireFile, 0, len(files))
-	for name, data := range files {
-		wireFiles = append(wireFiles, wireFile{Name: name, Data: data})
+	slices.SortFunc(names, strings.Compare)
+	for _, name := range names {
+		err := enc.Encode(&wireFile{Name: name, Data: files[name]})
+		if err != nil {
+			return err
+		}
 	}
-	slices.SortFunc(wireFiles, func(a, b wireFile) int { return strings.Compare(a.Name, b.Name) })
-	return wireFiles
+	return nil
 }
 
-// wireFilesMap returns an error for duplicate file names,
+// readWireFiles returns an error for duplicate file names,
 // which a map can't represent
-func wireFilesMap(wireFiles []wireFile) (map[string][]byte, error) {
-	if len(wireFiles) == 0 {
+func readWireFiles(dec *gob.Decoder, numFiles int) (map[string][]byte, error) {
+	if numFiles == 0 {
 		return nil, nil
 	}
-	files := make(map[string][]byte, len(wireFiles))
-	for _, f := range wireFiles {
-		if _, exists := files[f.Name]; exists {
-			return nil, fmt.Errorf("duplicate file name %q", f.Name)
+	files := make(map[string][]byte, numFiles)
+	for range numFiles {
+		var file wireFile
+		err := dec.Decode(&file)
+		if err != nil {
+			return nil, err
 		}
-		files[f.Name] = f.Data
+		if _, exists := files[file.Name]; exists {
+			return nil, fmt.Errorf("duplicate file name %q", limitString(file.Name, maxErrorStringLength))
+		}
+		files[file.Name] = file.Data
 	}
 	return files, nil
+}
+
+// budgetReader reads at most n bytes from r and then returns
+// errWireMessageTooLarge. It implements io.ByteReader so that
+// gob reads exactly its messages from it without buffering.
+type budgetReader struct {
+	r *bufio.Reader
+	n int64
+}
+
+func (b *budgetReader) Read(p []byte) (int, error) {
+	if b.n <= 0 {
+		return 0, errWireMessageTooLarge
+	}
+	if int64(len(p)) > b.n {
+		p = p[:b.n]
+	}
+	n, err := b.r.Read(p)
+	b.n -= int64(n)
+	return n, err
+}
+
+func (b *budgetReader) ReadByte() (byte, error) {
+	if b.n <= 0 {
+		return 0, errWireMessageTooLarge
+	}
+	c, err := b.r.ReadByte()
+	if err == nil {
+		b.n--
+	}
+	return c, err
 }

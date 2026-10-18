@@ -16,6 +16,18 @@ const fileNameSeparators = `/\`
 // of common file systems
 const maxFileNameLength = 255
 
+// maxErrorStringLength is the maximum length in bytes
+// of strings from requests that are put into error messages
+const maxErrorStringLength = 256
+
+// limitString returns s cut to maxLen bytes with "..." appended if it was longer
+func limitString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
 // Command represents a CLI command to be executed with associated input files and configuration.
 // Commands can be executed locally or remotely via the rcom server.
 type Command struct {
@@ -68,10 +80,10 @@ func (c *Command) Validate() error {
 			return errors.New("rcom.Command: empty result file pattern")
 		}
 		if patterns[pattern] {
-			return fmt.Errorf("rcom.Command: duplicate result file pattern %q", pattern)
+			return fmt.Errorf("rcom.Command: duplicate result file pattern %q", limitString(pattern, maxErrorStringLength))
 		}
 		if _, err := path.Match(pattern, ""); err != nil {
-			return fmt.Errorf("rcom.Command: invalid result file pattern %q: %w", pattern, err)
+			return fmt.Errorf("rcom.Command: invalid result file pattern %q: %w", limitString(pattern, maxErrorStringLength), err)
 		}
 		patterns[pattern] = true
 	}
@@ -91,9 +103,9 @@ func validateFileName(fileName string) error {
 		case name == "":
 			return errors.New("rcom.Command: empty filename")
 		case name == "." || name == ".." || strings.ContainsRune(name, 0) || len(name) > maxFileNameLength:
-			return fmt.Errorf("rcom.Command: invalid filename %q", fileName)
+			return fmt.Errorf("rcom.Command: invalid filename %q", limitString(fileName, maxErrorStringLength))
 		case strings.ContainsAny(name, fileNameSeparators):
-			return fmt.Errorf("rcom.Command: filename %q must not contain path separators", fileName)
+			return fmt.Errorf("rcom.Command: filename %q must not contain path separators", limitString(fileName, maxErrorStringLength))
 		}
 	}
 	return nil

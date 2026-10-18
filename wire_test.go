@@ -1,8 +1,10 @@
 package rcom
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/gob"
+	"fmt"
 	"runtime"
 	"testing"
 
@@ -16,31 +18,22 @@ func Test_wireCommand(t *testing.T) {
 		Name:               "convert",
 		Args:               []string{"in.png", "out.jpg"},
 		Stdin:              []byte("stdin"),
-		Files:              map[string][]byte{"in.png": []byte("png"), "b.txt": []byte("b"), "empty.txt": {}},
+		Files:              map[string][]byte{"in.png": []byte("png"), "b.txt": []byte("b"), "empty.txt": nil},
 		ResultFilePatterns: []string{"*.jpg"},
-		NonErrorExitCodes:  map[int]bool{1: true, 3: true, 2: false},
+		NonErrorExitCodes:  map[int]bool{1: true, 3: true},
 	}
-	wire := newWireCommand(command)
-	assert.Equal(t, []string{"b.txt", "empty.txt", "in.png"}, []string{wire.Files[0].Name, wire.Files[1].Name, wire.Files[2].Name}, "files sorted by name")
-	assert.Equal(t, []int{1, 3}, wire.NonErrorExitCodes, "only codes mapped to true")
-
 	buf := bytes.NewBuffer(nil)
-	require.NoError(t, gob.NewEncoder(buf).Encode(wire))
-	var decodedWire wireCommand
-	require.NoError(t, gob.NewDecoder(buf).Decode(&decodedWire))
-	decoded, err := decodedWire.command()
+	require.NoError(t, writeWireCommand(buf, command))
+	decoded, err := readWireCommand(bufio.NewReader(buf))
 	require.NoError(t, err)
+	assert.Equal(t, command, decoded)
 
-	assert.Equal(t, command.Name, decoded.Name)
-	assert.Equal(t, command.Args, decoded.Args)
-	assert.Equal(t, command.Stdin, decoded.Stdin)
-	assert.Equal(t, command.ResultFilePatterns, decoded.ResultFilePatterns)
-	assert.Equal(t, map[int]bool{1: true, 3: true}, decoded.NonErrorExitCodes)
-	assert.Equal(t, []byte("png"), decoded.Files["in.png"])
-	assert.Contains(t, decoded.Files, "empty.txt", "empty file is kept")
-
-	_, err = (&wireCommand{Name: "x", Files: []wireFile{{Name: "a"}, {Name: "a"}}}).command()
-	assert.ErrorContains(t, err, `duplicate file name "a"`)
+	// Only exit codes mapped to true are sent
+	buf.Reset()
+	require.NoError(t, writeWireCommand(buf, &Command{Name: "x", NonErrorExitCodes: map[int]bool{1: true, 2: false}}))
+	decoded, err = readWireCommand(bufio.NewReader(buf))
+	require.NoError(t, err)
+	assert.Equal(t, map[int]bool{1: true}, decoded.NonErrorExitCodes)
 }
 
 func Test_wireResult(t *testing.T) {
@@ -50,41 +43,80 @@ func Test_wireResult(t *testing.T) {
 		Output:   "out err",
 		Stdout:   "out",
 		Stderr:   "err",
-		Files:    map[string][]byte{"out.jpg": []byte("jpg")},
+		Files:    map[string][]byte{"out.jpg": []byte("jpg"), "empty.txt": nil},
 	}
 	buf := bytes.NewBuffer(nil)
-	require.NoError(t, gob.NewEncoder(buf).Encode(newWireResult(result)))
-	var wire wireResult
-	require.NoError(t, gob.NewDecoder(buf).Decode(&wire))
-	decoded, err := wire.result()
+	require.NoError(t, writeWireResult(buf, result))
+	decoded, err := readWireResult(buf)
 	require.NoError(t, err)
 	assert.Equal(t, result, decoded)
-
-	_, err = (&wireResult{Files: []wireFile{{Name: "a"}, {Name: "a"}}}).result()
-	assert.ErrorContains(t, err, `duplicate file name "a"`)
 }
 
-// Test_wireCommand_declaredCount decodes a message that declares
-// 16 million exit codes but contains only one, which must not
-// allocate memory for the declared count up front.
-func Test_wireCommand_declaredCount(t *testing.T) {
+// encodeGob encodes the values as one gob stream
+func encodeGob(t *testing.T, values ...any) *bytes.Buffer {
+	t.Helper()
 	buf := bytes.NewBuffer(nil)
-	require.NoError(t, gob.NewEncoder(buf).Encode(newWireCommand(&Command{
-		Name:              "x",
-		NonErrorExitCodes: map[int]bool{123456: true},
-	})))
-	message := setGobCount(t, buf.Bytes(), gobInt(123456), 1<<24)
+	enc := gob.NewEncoder(buf)
+	for _, v := range values {
+		require.NoError(t, enc.Encode(v))
+	}
+	return buf
+}
 
+func Test_readWireCommand_limits(t *testing.T) {
+	t.Run("duplicate file names", func(t *testing.T) {
+		stream := encodeGob(t, &wireCommandHeader{Name: "x", NumFiles: 2}, &wireFile{Name: "a"}, &wireFile{Name: "a"})
+		_, err := readWireCommand(bufio.NewReader(stream))
+		assert.ErrorContains(t, err, `duplicate file name "a"`)
+	})
+
+	t.Run("too many files", func(t *testing.T) {
+		stream := encodeGob(t, &wireCommandHeader{Name: "x", NumFiles: maxWireFiles + 1})
+		_, err := readWireCommand(bufio.NewReader(stream))
+		assert.ErrorContains(t, err, fmt.Sprintf("the maximum is %d", maxWireFiles))
+	})
+
+	t.Run("maximum number of empty files", func(t *testing.T) {
+		values := []any{&wireCommandHeader{Name: "x", NumFiles: maxWireFiles}}
+		for i := range maxWireFiles {
+			values = append(values, &wireFile{Name: fmt.Sprint(i)})
+		}
+		command, err := readWireCommand(bufio.NewReader(encodeGob(t, values...)))
+		require.NoError(t, err)
+		assert.Len(t, command.Files, maxWireFiles)
+	})
+
+	t.Run("header too large", func(t *testing.T) {
+		// Every empty argument string is one byte in the message
+		// but 16 bytes in memory
+		stream := encodeGob(t, &wireCommandHeader{Name: "x", Args: make([]string, 2*maxWireHeaderSize)})
+		allocated := measureAlloc(func() {
+			_, err := readWireCommand(bufio.NewReader(stream))
+			assert.ErrorIs(t, err, errWireMessageTooLarge)
+		})
+		assert.Less(t, allocated, uint64(8*maxWireHeaderSize), "allocated %d MiB", allocated>>20)
+	})
+
+	t.Run("declared count without data", func(t *testing.T) {
+		// A message declaring 16 million exit codes but containing only one
+		stream := encodeGob(t, &wireCommandHeader{Name: "x", NonErrorExitCodes: []int{123456}})
+		message := setGobCount(t, stream.Bytes(), gobInt(123456), 1<<24)
+		allocated := measureAlloc(func() {
+			_, err := readWireCommand(bufio.NewReader(bytes.NewReader(message)))
+			assert.Error(t, err, "message is truncated")
+		})
+		assert.Less(t, allocated, uint64(32<<20), "allocated %d MiB", allocated>>20)
+	})
+}
+
+// measureAlloc returns the bytes allocated by f
+func measureAlloc(f func()) uint64 {
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
-	var wire wireCommand
-	err := gob.NewDecoder(bytes.NewReader(message)).Decode(&wire)
+	f()
 	runtime.ReadMemStats(&after)
-
-	assert.Error(t, err, "message is truncated")
-	allocated := after.TotalAlloc - before.TotalAlloc
-	assert.Less(t, allocated, uint64(32<<20), "allocated %d MiB", allocated>>20)
+	return after.TotalAlloc - before.TotalAlloc
 }
 
 // gobInt returns the gob encoding of the int i

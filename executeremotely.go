@@ -3,7 +3,6 @@ package rcom
 import (
 	"bytes"
 	"context"
-	"encoding/gob"
 	"fmt"
 	"io"
 	"net/http"
@@ -47,7 +46,7 @@ func ExecuteRemotely(ctx context.Context, addr string, c *Command) (result *Resu
 	}
 
 	buf := bytes.NewBuffer(nil)
-	err = gob.NewEncoder(buf).Encode(newWireCommand(c))
+	err = writeWireCommand(buf, c)
 	if err != nil {
 		return nil, err
 	}
@@ -69,10 +68,5 @@ func ExecuteRemotely(ctx context.Context, addr string, c *Command) (result *Resu
 		return nil, fmt.Errorf("rcom.Command: response status %s: %s", response.Status, bytes.TrimSpace(message))
 	}
 
-	var wire wireResult
-	err = gob.NewDecoder(response.Body).Decode(&wire)
-	if err != nil {
-		return nil, err
-	}
-	return wire.result()
+	return readWireResult(response.Body)
 }
