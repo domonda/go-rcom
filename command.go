@@ -3,6 +3,8 @@ package rcom
 import (
 	"errors"
 	"fmt"
+	"net/url"
+	"path"
 	"strings"
 )
 
@@ -42,19 +44,18 @@ type Command struct {
 
 // Validate checks that the command is properly configured.
 // Returns an error if:
-// - Name is empty
-// - Any filename is empty or contains path separators
-// - Any result file pattern is empty or duplicated
+//   - Name is empty
+//   - Any filename is empty, "." or "..", or contains path separators,
+//     also in URL-encoded form like "%2F"
+//   - Any result file pattern is empty, duplicated or malformed
 func (c *Command) Validate() error {
 	if c.Name == "" {
 		return errors.New("rcom.Command: no command name provided")
 	}
 	for fileName := range c.Files {
-		if fileName == "" {
-			return errors.New("rcom.Command: empty filename")
-		}
-		if strings.ContainsAny(fileName, fileNameSeparators) {
-			return errors.New("rcom.Command: filename must not contain path separators")
+		err := validateFileName(fileName)
+		if err != nil {
+			return err
 		}
 	}
 	patterns := make(map[string]bool)
@@ -65,7 +66,31 @@ func (c *Command) Validate() error {
 		if patterns[pattern] {
 			return fmt.Errorf("rcom.Command: duplicate result file pattern %q", pattern)
 		}
+		if _, err := path.Match(pattern, ""); err != nil {
+			return fmt.Errorf("rcom.Command: invalid result file pattern %q: %w", pattern, err)
+		}
 		patterns[pattern] = true
+	}
+	return nil
+}
+
+// validateFileName returns an error if fileName is not a plain file name
+// that stays in its directory. The URL-decoded form of the name is checked
+// too, because some file system libraries decode paths.
+func validateFileName(fileName string) error {
+	names := []string{fileName}
+	if decoded, err := url.PathUnescape(fileName); err == nil && decoded != fileName {
+		names = append(names, decoded)
+	}
+	for _, name := range names {
+		switch {
+		case name == "":
+			return errors.New("rcom.Command: empty filename")
+		case name == "." || name == "..":
+			return fmt.Errorf("rcom.Command: invalid filename %q", fileName)
+		case strings.ContainsAny(name, fileNameSeparators):
+			return fmt.Errorf("rcom.Command: filename %q must not contain path separators", fileName)
+		}
 	}
 	return nil
 }

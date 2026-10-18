@@ -2,6 +2,9 @@ package rcom
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -25,4 +28,42 @@ func Test_ExecuteLocally_callIDIsUUIDv7(t *testing.T) {
 	require.True(t, ok, "callID is a version 7 UUID")
 	assert.False(t, started.Before(before), "callID time %s is not before the call (%s)", started, before)
 	assert.False(t, started.After(after), "callID time %s is not after the call (%s)", started, after)
+}
+
+func Test_ExecuteLocally_fileNameOutsideWorkingDir(t *testing.T) {
+	// The default TempDir is the parent of the working dir
+	// that an escaping file name would write into
+	tempDir := t.TempDir()
+	t.Setenv("TMPDIR", tempDir)
+	t.Setenv("TMP", tempDir)
+	t.Setenv("TEMP", tempDir)
+
+	command, _ := cpCommand()
+	command.Files["..%2Fescaped.txt"] = []byte("escaped")
+
+	_, _, err := ExecuteLocally(context.Background(), command)
+	require.Error(t, err)
+	assert.NoFileExists(t, filepath.Join(tempDir, "escaped.txt"))
+}
+
+func Test_ExecuteLocally_symlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses ln")
+	}
+
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "outside.txt")
+	require.NoError(t, os.WriteFile(outsideFile, []byte("outside"), 0o600))
+
+	// The command creates a symlink to a directory and one to a file
+	// outside of its working dir
+	command := &Command{
+		Name: "sh",
+		Args: []string{"-c", `ln -s "$0" dir-link && ln -s "$1" file-link.txt`, outsideDir, outsideFile},
+	}
+	result, _, err := ExecuteLocally(context.Background(), command)
+	require.NoError(t, err)
+
+	assert.NotContains(t, result.Files, "file-link.txt", "symlinked file is not a result file")
+	assert.FileExists(t, outsideFile, "cleanup does not delete through the symlinked dir")
 }

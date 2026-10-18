@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"path"
 	"time"
 
 	"github.com/domonda/go-rcom/pkg/exec"
@@ -53,17 +55,28 @@ func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.
 	if err != nil {
 		return nil, callID, err
 	}
-	// Clean up after call and log errors
+	dirPath := dir.MustLocalPath()
+	// Clean up after call and log errors.
+	// os.RemoveAll removes symlinks the command created
+	// without deleting what they point to.
 	defer func() {
-		err := dir.RemoveRecursive()
+		err := os.RemoveAll(dirPath)
 		if err != nil {
 			log.Error("Can't clean up after command").Err(err).Log()
 		}
 	}()
 
+	// All file access goes through root so that no file name
+	// or symlink can reach outside of the working dir
+	root, err := os.OpenRoot(dirPath)
+	if err != nil {
+		return nil, callID, err
+	}
+	defer root.Close()
+
 	// Add files to working dir
 	for fileName, fileData := range c.Files {
-		err = dir.Join(fileName).WriteAllContext(ctx, fileData)
+		err = root.WriteFile(fileName, fileData, 0o600)
 		if err != nil {
 			return nil, callID, fmt.Errorf("can't copy file %q because of error: %w", fileName, err)
 		}
@@ -75,7 +88,7 @@ func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.
 	}
 
 	r, err := exec.Command(c.Name, c.Args...).
-		WithDir(dir.MustLocalPath()).
+		WithDir(dirPath).
 		WithStdin(stdin).
 		WithKillSubProcesses().
 		Run(ctx)
@@ -87,33 +100,72 @@ func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.
 		return nil, callID, fmt.Errorf("%w\nCommand output: %s", err, r.Output)
 	}
 
+	files, err := readResultFiles(root, c.ResultFilePatterns)
+	if err != nil {
+		return nil, callID, fmt.Errorf("can't read result files: %w", err)
+	}
+
 	result = &Result{
 		CallID:   callID,
 		ExitCode: r.ExitCode,
 		Output:   r.Output,
 		Stdout:   r.Stdout,
 		Stderr:   r.Stderr,
-		Files:    make(map[string][]byte),
+		Files:    files,
 	}
-
-	err = dir.ListDir(
-		func(file fs.File) error {
-			if file.IsDir() {
-				return nil
-			}
-			data, err := file.ReadAllContext(ctx)
-			if err != nil {
-				return err
-			}
-			result.Files[file.Name()] = data
-			return nil
-		},
-		c.ResultFilePatterns...,
-	)
 
 	log.Debug("ExecuteLocally finished").
 		Stringer("duration", time.Since(start)).
 		Log()
 
 	return result, callID, nil
+}
+
+// readResultFiles reads the regular files in the root directory
+// with a name matching any of the patterns,
+// or all regular files if no patterns are passed.
+// Directories, symlinks and other special files are skipped.
+func readResultFiles(root *os.Root, patterns []string) (map[string][]byte, error) {
+	dir, err := root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	entries, err := dir.ReadDir(-1)
+	if err != nil {
+		return nil, err
+	}
+
+	files := make(map[string][]byte)
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		match, err := matchAnyPattern(entry.Name(), patterns)
+		if err != nil {
+			return nil, err
+		}
+		if !match {
+			continue
+		}
+		data, err := root.ReadFile(entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		files[entry.Name()] = data
+	}
+	return files, nil
+}
+
+func matchAnyPattern(name string, patterns []string) (bool, error) {
+	if len(patterns) == 0 {
+		return true, nil
+	}
+	for _, pattern := range patterns {
+		match, err := path.Match(pattern, name)
+		if match || err != nil {
+			return match, err
+		}
+	}
+	return false, nil
 }

@@ -67,3 +67,43 @@ func Test_Command_ExecuteRemotely(t *testing.T) {
 	assert.True(t, ok, "expected result file exists")
 	assert.Equal(t, expectedFile.FileData, resultFileData, "result file has expected content")
 }
+
+func Test_Command_Validate(t *testing.T) {
+	valid := &Command{
+		Name:               copyCmd(),
+		Files:              map[string][]byte{"input.txt": nil, "100%.txt": nil, "a%20b.txt": nil},
+		ResultFilePatterns: []string{"*.txt", "output-?.json"},
+	}
+	assert.NoError(t, valid.Validate())
+
+	// Each file name must stay in the working directory,
+	// also after URL-decoding by file system libraries
+	invalidFileNames := []string{
+		"",
+		".",
+		"..",
+		"dir/input.txt",
+		`dir\input.txt`,
+		`C:\input.txt`,
+		"..%2Finput.txt",
+		"..%5Cinput.txt",
+		"dir%2finput.txt",
+		"%2E%2E",
+	}
+	for _, name := range invalidFileNames {
+		command := &Command{Name: copyCmd(), Files: map[string][]byte{name: nil}}
+		assert.Error(t, command.Validate(), "file name %q", name)
+	}
+
+	invalidPatterns := map[string][]string{
+		"empty":     {""},
+		"duplicate": {"*.txt", "*.txt"},
+		"malformed": {"["},
+	}
+	for name, patterns := range invalidPatterns {
+		command := &Command{Name: copyCmd(), ResultFilePatterns: patterns}
+		assert.Error(t, command.Validate(), name)
+	}
+
+	assert.Error(t, (&Command{}).Validate(), "no command name")
+}
