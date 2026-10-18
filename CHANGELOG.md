@@ -11,30 +11,83 @@ Releases are git-tagged with the version from the `VERSION` file.
 
 ## [0.1.0] - 2026-10-18
 
-First tagged release.
+First tagged release. It requires Go 1.26 and depends on tagged releases:
+go-types v1.0.0-beta.2, golog v1.3.0 and go-fs v0.1.0. The Changed, Fixed and
+Security sections compare with the earlier untagged builds.
 
 ### Added
 
 - `Command` describes a CLI call: its name, arguments, input files, stdin,
   glob patterns for result files and exit codes that do not count as errors.
   `Result` carries the combined output, stdout, stderr, exit code and the
-  matched result files; `Result.WriteTo` saves a result file.
-  `Command.Validate` rejects input file names that contain a path separator.
-- `ExecuteLocally` runs a `Command` in a fresh temporary directory named with
-  a time-sortable UUID v7 call ID, and removes the directory afterwards.
+  matched result files; `Result.WriteTo` saves a non-empty result file.
+- `ExecuteLocally` runs a `Command` in its own temporary working directory,
+  named with a time-sortable UUID v7 call ID, and removes it afterwards.
 - `ExecuteRemotely` sends a gob-encoded `Command` to an rcom server over HTTP.
-- The `Executor` interface, `ExecutorFunc` and `LocalExecutor` let code switch
+- `RemoteExecutor` joins `LocalExecutor` as an `Executor`, so code can switch
   between local and remote execution.
 - `Client` and `NewClient` with the options `ClientWithHost`,
   `ClientWithPort`, `ClientWithCmds` and `ClientWithTimeOut`.
-- `ListenAndServe` starts an HTTP server that only runs whitelisted commands
-  and optionally shuts down gracefully on SIGTERM, SIGINT and SIGHUP within
-  `GracefulShutdownTimeout`. `SetLogger` replaces the package logger.
+- `ListenAndServe` serves the whitelisted command names (their arguments are
+  not restricted) with optional graceful shutdown on SIGTERM, SIGINT and
+  SIGHUP. `SetLogger` replaces the package logger.
+- `MaxRequestSize` (default 1 GiB, larger requests get HTTP 413) and
+  `MaxConcurrentCommands` (default `GOMAXPROCS`, further requests wait) limit
+  the server, which also sets header read and idle timeouts.
 - `pkg/exec` wraps `os/exec` with builder methods and can kill a command's
   subprocesses when its context is canceled.
 
 ### Changed
 
-- Requires Go 1.26.0.
-- Depends on tagged releases: go-types v1.0.0-beta.2, golog v1.3.0 and
-  go-fs v0.1.0.
+- **Breaking:** `rcom-server` takes the port and the allowed commands as
+  arguments: `rcom-server PORT ALLOWED_COMMAND...`. An empty port uses the
+  `PORT` environment variable or 3666. Without commands it exits with status 2.
+- **Breaking (via go-types):** call IDs now store their UUID v7 timestamp
+  big-endian as RFC 9562 requires, so they sort by time. Call IDs from
+  earlier untagged builds do not sort against new ones and decode to wrong
+  times. go-types also changed `uu.ID` methods such as `V7Time`, which now
+  returns `(time.Time, bool)`.
+- With graceful shutdown, `ListenAndServe` returns `http.ErrServerClosed`
+  after the running requests have finished. Requests still running after
+  `GracefulShutdownTimeout`, or when a second signal arrives, are canceled
+  and the shutdown error is returned after their cleanup.
+- `Command.Validate` also rejects file names that are `.` or `..`, contain
+  NUL, are longer than 255 bytes or contain a URL-encoded path separator,
+  and malformed result file patterns.
+- The client sends each input file under its base name, also when the name
+  is a Windows path like the file name of a browser upload, and returns an
+  error for two input files with the same base name.
+- The server answers invalid commands and requests with data after the
+  command with 400, and requests waiting for a command slot during shutdown
+  with 503.
+- Result files are regular files only; symlinks and directories in the
+  working directory are skipped.
+- Errors of `ExecuteRemotely` contain the server's error message.
+
+### Fixed
+
+- `NonErrorExitCodes` had no effect: every non-zero exit code was an error,
+  with the message `%!w(<nil>)`.
+- `ListenAndServe` returned as soon as a graceful shutdown started, so
+  programs exited while commands were still running.
+- `rcom-server` rejected every command.
+- A data race in `pkg/exec` lost bytes of `Result.Output` when a command
+  wrote to stdout and stderr.
+- `ExecuteRemotely` leaked a connection for every non-200 response.
+- The package did not build on Windows (`copyCmd redeclared`).
+- Errors while collecting result files were ignored.
+- IPv6 hosts produced an invalid client URL.
+- `Result.WriteTo` reported an empty result file of a remote command as
+  missing.
+- Input file names that differ only in case overwrote each other on macOS
+  and Windows; they are now an error.
+
+### Security
+
+- Input file names like `..%2Fx` escaped the working directory because go-fs
+  URL-decodes paths. Input files are now written and result files read
+  through an `os.Root` of the working directory.
+- Cleanup no longer deletes through symlinks the command created, and result
+  collection no longer follows them out of the working directory.
+- The server has no authentication and decodes requests before checking the
+  command name; see the security considerations in the README.
