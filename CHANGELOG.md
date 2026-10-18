@@ -31,17 +31,33 @@ Security sections compare with the earlier untagged builds.
 - `ListenAndServe` serves the whitelisted command names (their arguments are
   not restricted) with optional graceful shutdown on SIGTERM, SIGINT and
   SIGHUP. `SetLogger` replaces the package logger.
-- `MaxRequestSize` (default 1 GiB, larger requests get HTTP 413) and
-  `MaxConcurrentCommands` (default `GOMAXPROCS`, further requests wait) limit
-  the server, which also sets header read and idle timeouts.
-- `pkg/exec` wraps `os/exec` with builder methods and can kill a command's
-  subprocesses when its context is canceled.
+- Server limits: `MaxRequestSize` (default 1 GiB, larger requests get HTTP
+  413), `MaxConnections` (256, further connections wait), `StallTimeout`
+  (1 minute without the client sending or receiving ends the request),
+  `MaxConcurrentCommands` (`GOMAXPROCS`, further requests wait) and
+  `MaxCommandDuration` (1 hour). The server also sets header read and idle
+  timeouts, and cancels a command when its client closes the connection.
+- `ExecuteLocally` limits: `MaxOutputSize` (64 MiB of stdout and stderr, the
+  command is killed above) and `MaxResultFilesSize` (1 GiB). It stops waiting
+  for the output 2 s after the command exited, and errors contain only the
+  last 64 KiB of the output.
+- `InheritedEnvVars` lists the environment variables commands inherit.
+- `pkg/exec` wraps `os/exec` with builder methods, can kill a command's
+  subprocesses when its context is canceled or after it exited, and has
+  `WithWaitDelay` and `WithMaxOutputSize`. It also builds on the BSDs.
 
 ### Changed
 
+- **Breaking:** the gob wire format sends files and exit codes as slices
+  instead of maps, so clients and servers of this release can't talk to
+  earlier untagged builds.
+- **Breaking:** commands only inherit the `InheritedEnvVars` (`PATH`,
+  `HOME`, locale, temp dir and library path variables) instead of the whole
+  environment. Set it to nil to inherit all variables.
 - **Breaking:** `rcom-server` takes the port and the allowed commands as
   arguments: `rcom-server PORT ALLOWED_COMMAND...`. An empty port uses the
-  `PORT` environment variable or 3666. Without commands it exits with status 2.
+  `PORT` environment variable or 3666. Without commands or with an invalid
+  port it exits with status 2.
 - **Breaking (via go-types):** call IDs now store their UUID v7 timestamp
   big-endian as RFC 9562 requires, so they sort by time. Call IDs from
   earlier untagged builds do not sort against new ones and decode to wrong
@@ -60,8 +76,10 @@ Security sections compare with the earlier untagged builds.
 - The server answers invalid commands and requests with data after the
   command with 400, and requests waiting for a command slot during shutdown
   with 503.
-- Result files are regular files only; symlinks and directories in the
-  working directory are skipped.
+- Result files are regular files only; symlinks, directories and files with
+  more than one hard link in the working directory are skipped.
+- The working directory is created with mode 0700 and input files with 0600,
+  instead of 0771 and 0660.
 - Errors of `ExecuteRemotely` contain the server's error message.
 
 ### Fixed
@@ -89,5 +107,11 @@ Security sections compare with the earlier untagged builds.
   through an `os.Root` of the working directory.
 - Cleanup no longer deletes through symlinks the command created, and result
   collection no longer follows them out of the working directory.
+- A request of a few hundred bytes could make the server allocate hundreds of
+  MiB, because gob allocates maps from the entry count a message declares.
+- Clients that stop sending or receiving held connections and memory
+  indefinitely, and a client that disconnected after sending more data than
+  its request left its command running.
+- Commands inherited secrets from the environment of the server.
 - The server has no authentication and decodes requests before checking the
   command name; see the security considerations in the README.
