@@ -93,3 +93,24 @@ func Test_ExecuteLocally_NonErrorExitCodes(t *testing.T) {
 		assert.ErrorContains(t, err, "failed")
 	}
 }
+
+func Test_ExecuteLocally_fileNamesDifferingInCase(t *testing.T) {
+	// Detect if the temp dir file system ignores case
+	probe := filepath.Join(t.TempDir(), "CASE")
+	require.NoError(t, os.WriteFile(probe, nil, 0o600))
+	_, err := os.Stat(filepath.Join(filepath.Dir(probe), "case"))
+	caseInsensitive := err == nil
+
+	command, _ := cpCommand()
+	command.Files["A.txt"] = []byte("upper")
+	command.Files["a.txt"] = []byte("lower")
+	result, _, err := ExecuteLocally(context.Background(), command)
+	if caseInsensitive {
+		// One file would silently overwrite the other
+		assert.ErrorIs(t, err, os.ErrExist)
+		return
+	}
+	require.NoError(t, err)
+	assert.Equal(t, []byte("upper"), result.Files["A.txt"])
+	assert.Equal(t, []byte("lower"), result.Files["a.txt"])
+}

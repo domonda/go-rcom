@@ -74,10 +74,9 @@ func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.
 	}
 	defer root.Close()
 
-	// Add files to working dir with the go-fs default
-	// permissions used before for user and group read/write
+	// Add files to working dir
 	for fileName, fileData := range c.Files {
-		err = root.WriteFile(fileName, fileData, 0o660)
+		err = writeNewFile(root, fileName, fileData)
 		if err != nil {
 			return nil, callID, fmt.Errorf("can't copy file %q because of error: %w", fileName, err)
 		}
@@ -120,6 +119,22 @@ func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.
 		Log()
 
 	return result, callID, nil
+}
+
+// writeNewFile writes data to a new file in root with the go-fs default
+// permissions for user and group read/write. It returns an error if the
+// file already exists, which happens for names that differ only in case
+// on case-insensitive file systems.
+func writeNewFile(root *os.Root, name string, data []byte) error {
+	file, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o660)
+	if err != nil {
+		return err
+	}
+	_, err = file.Write(data)
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 // readResultFiles reads the regular files in the root directory
