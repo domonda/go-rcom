@@ -74,9 +74,10 @@ func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.
 	}
 	defer root.Close()
 
-	// Add files to working dir
+	// Add files to working dir with the go-fs default
+	// permissions used before for user and group read/write
 	for fileName, fileData := range c.Files {
-		err = root.WriteFile(fileName, fileData, 0o600)
+		err = root.WriteFile(fileName, fileData, 0o660)
 		if err != nil {
 			return nil, callID, fmt.Errorf("can't copy file %q because of error: %w", fileName, err)
 		}
