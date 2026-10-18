@@ -14,7 +14,8 @@ Go package for executing remote CLI commands with input/output file support over
 - **Command Whitelisting**: Server restricts execution to explicitly allowed commands
 - **Timeout Support**: Configurable timeouts for command execution
 - **Separate Working Directories**: Each command runs in its own temporary directory
-- **Server Limits**: Maximum request size and number of concurrent commands
+- **Server Limits**: Request size, connections, stalled transfers, concurrent commands,
+  command duration, output and result file sizes
 - **Context Support**: Full context.Context support for cancellation
 
 ## Installation
@@ -24,6 +25,10 @@ Requires Go 1.26 or later.
 ```bash
 go get github.com/domonda/go-rcom
 ```
+
+Clients and servers must use the same wire format: v0.1.0 changed it,
+so it can't talk to earlier untagged builds.
+See [CHANGELOG.md](CHANGELOG.md) for the changes of each release.
 
 ## Quick Start
 
@@ -285,20 +290,33 @@ err := rcom.ListenAndServe(8080, false, "convert")
 With graceful shutdown, `ListenAndServe` returns `http.ErrServerClosed`
 after the running requests have finished. Requests still running after
 `GracefulShutdownTimeout`, or when a second signal arrives, are canceled
-and `ListenAndServe` returns the shutdown error:
+and `ListenAndServe` returns the shutdown error. A zero or negative
+`GracefulShutdownTimeout` waits for the running requests until a second signal:
 
 ```go
 rcom.GracefulShutdownTimeout = 2 * time.Minute
 err := rcom.ListenAndServe(8080, true, "convert")
 ```
 
-### Request Size and Concurrency
+### Server Limits
 
-The server rejects requests larger than `MaxRequestSize` (default 1 GiB)
-with 413 and executes at most `MaxConcurrentCommands` (default: `GOMAXPROCS`,
-which follows container CPU limits) commands at a time. Further requests wait,
-and are rejected with 503 if the server shuts down while they wait.
-Zero means no limit:
+`ListenAndServe` applies these package variables as they are set when it is called.
+Zero or a negative value means no limit:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MaxRequestSize` | 1 GiB | Larger requests are rejected with 413 |
+| `MaxConnections` | 256 | Further connections wait to be accepted |
+| `StallTimeout` | 1 minute | Ends a request whose client stops sending or receiving |
+| `MaxConcurrentCommands` | `GOMAXPROCS` | Further requests wait, and get 503 if the server shuts down |
+| `MaxCommandDuration` | 1 hour | Longer running commands are killed |
+
+`ExecuteLocally`, which the server uses, also applies:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MaxOutputSize` | 64 MiB | A command writing more to stdout and stderr is killed |
+| `MaxResultFilesSize` | 1 GiB | Larger result files together are an error |
 
 ```go
 rcom.MaxRequestSize = 100 << 20 // 100 MiB
@@ -306,15 +324,25 @@ rcom.MaxConcurrentCommands = 4
 err := rcom.ListenAndServe(8080, true, "convert")
 ```
 
+### Command Environment
+
+Commands only inherit the environment variables listed in `InheritedEnvVars`
+(`PATH`, `HOME`, locale, temp dir and library path variables by default),
+so that secrets in the environment of the server don't reach them.
+Add variables a command needs, or set it to nil to inherit all:
+
+```go
+rcom.InheritedEnvVars = append(rcom.InheritedEnvVars, "MAGICK_HOME")
+```
+
 ### Custom Logger
 
 Use a custom logger:
 
 ```go
-import "github.com/domonda/golog"
+import "github.com/domonda/golog/log"
 
-logger := golog.NewLogger("rcom-server")
-rcom.SetLogger(logger)
+rcom.SetLogger(log.WithPrefix("rcom-server: "))
 ```
 
 ## Architecture
@@ -323,23 +351,25 @@ rcom.SetLogger(logger)
 
 1. **Client** creates a `Command` with name, args, files, and result patterns
 2. **Client** encodes command using `encoding/gob` and sends via HTTP POST
-3. **Server** receives request, validates command is allowed
+3. **Server** receives request, validates command is allowed,
+   and cancels the command if the client closes the connection
 4. **Server** creates unique temporary directory for execution
 5. **Server** writes input files to temp directory
 6. **Server** executes command in temp directory with stdin
 7. **Server** collects output, stderr, exit code, and result files matching patterns
-8. **Server** encodes `Result` and sends back to client
-9. **Server** cleans up temporary directory
+8. **Server** cleans up temporary directory
+9. **Server** encodes `Result` and sends back to client
 10. **Client** decodes result and makes files available
 
 ### Temporary Directory
 
 Each command execution gets a unique temporary directory:
-- Located in system temp dir
+- Located in system temp dir, accessible only by the user of the process
 - Named with a UUID v7 (time-sortable)
 - Input files are written here
 - Command executes with this as working directory
-- Result files are read from here, skipping symlinks and directories
+- Result files are read from here, skipping symlinks, directories
+  and files with more than one hard link
 - Directory is cleaned up after execution
 
 ### Security Considerations
@@ -354,16 +384,15 @@ Each command execution gets a unique temporary directory:
 3. **Separate Working Directory**: Each command runs in its own temporary directory.
    This is not a sandbox: the command runs with the permissions of the server process
 4. **Subprocess Cleanup**: Child processes are killed on cancellation
+   and when the command exited (not on Windows)
 5. **Input Validation**: Commands are validated before execution
 6. **No Authentication**: The server accepts requests from anyone who can reach
    its port over plain HTTP. Run it in a private network or behind an authenticating proxy
-7. **Untrusted Requests**: Requests are gob-decoded before the command name is checked,
-   and gob can allocate much more memory than a request's size.
-   `MaxRequestSize` and `MaxConcurrentCommands` do not bound memory use
-   against malicious clients, and commands have no time or output size limit.
-   A command keeps running if its client disconnects after sending more data
-   than the request, until it finishes or a graceful shutdown cancels it
-   after `GracefulShutdownTimeout` or a second signal
+7. **Untrusted Requests**: Requests are gob-decoded before the command name is checked.
+   The server limits bound the resources a client can use, but gob can allocate
+   up to about 10 MiB per connection before that data arrives,
+   so `MaxConnections` times 10 MiB of memory can be held by slow clients
+8. **Environment**: Commands only inherit the `InheritedEnvVars`
 
 ## Error Handling
 
@@ -377,6 +406,8 @@ All errors are returned with context. Common error scenarios:
 - **Request too large**: Requests larger than `MaxRequestSize` are rejected with 413
 - **Invalid request**: Invalid commands and data after the command are rejected with 400
 - **Shutting down**: Requests waiting for a command slot are rejected with 503
+- **Command limits**: Commands running longer than `MaxCommandDuration` or writing
+  more than `MaxOutputSize` are killed, and the server responds with 500
 - **Non-zero exit codes**: Treated as errors unless in `NonErrorExitCodes`
 - **Missing result files**: `Result.WriteTo` returns error if file not found
 - **Context cancellation**: Commands respect context cancellation

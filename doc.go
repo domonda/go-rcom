@@ -27,12 +27,12 @@ Create a client and execute commands:
 # Command Execution
 
 Commands are represented by the Command struct which includes:
-- Name: The command to execute
-- Args: Command arguments
-- Files: Input files (name -> content)
-- Stdin: Standard input data
-- ResultFilePatterns: Glob patterns for result files
-- NonErrorExitCodes: Exit codes to not treat as errors
+  - Name: The command to execute
+  - Args: Command arguments
+  - Files: Input files (name -> content)
+  - Stdin: Standard input data
+  - ResultFilePatterns: Glob patterns for result files
+  - NonErrorExitCodes: Exit codes to not treat as errors
 
 Both local and remote execution are supported:
 
@@ -64,14 +64,19 @@ Result files matching specified patterns are collected and returned:
 The server implements several security measures:
   - Command whitelisting: Only explicitly allowed command names can be executed.
     Arguments are passed through unchanged.
-  - Path validation: Filenames cannot contain path separators, also not URL-encoded,
-    and all file access goes through an os.Root of the working directory
+  - Path validation: Filenames cannot be ".", ".." or longer than 255 bytes, and cannot
+    contain NUL or path separators, also not URL-encoded. All file access goes
+    through an os.Root of the working directory.
   - Separate working directory: Each command runs in its own temporary directory,
-    which is not a sandbox
+    accessible only by the user of the process, which is not a sandbox
+  - Environment: Commands only inherit the InheritedEnvVars
   - Subprocess cleanup: Child processes are killed on context cancellation
-  - Limits: MaxRequestSize and MaxConcurrentCommands. They do not bound memory
-    against malicious clients, because requests are gob-decoded before the
-    command name is checked, and commands have no time or output size limit.
+    and after the command exited (not on Windows)
+  - Limits: MaxRequestSize, MaxConnections, StallTimeout, MaxConcurrentCommands,
+    MaxCommandDuration, MaxOutputSize and MaxResultFilesSize. Requests are
+    gob-decoded before the command name is checked, and gob can allocate up to
+    about 10 MiB per connection before that data arrives.
+  - Disconnects: A command is canceled when its client closes the connection
 
 The server has no authentication, run it in a private network.
 
@@ -92,12 +97,12 @@ This allows swapping between local and remote execution transparently:
 # Result Handling
 
 The Result struct contains:
-- CallID: Unique identifier for the execution
-- ExitCode: Command exit code
-- Output: Combined stdout and stderr
-- Stdout: Standard output
-- Stderr: Standard error
-- Files: Result files (name -> content)
+  - CallID: Unique identifier for the execution
+  - ExitCode: Command exit code
+  - Output: Combined stdout and stderr
+  - Stdout: Standard output
+  - Stderr: Standard error
+  - Files: Result files (name -> content)
 
 Access result files:
 
@@ -121,12 +126,15 @@ On receiving SIGTERM, SIGINT, or SIGHUP, the server will:
  2. Wait for in-flight requests to complete, then ListenAndServe returns http.ErrServerClosed
  3. Cancel requests still running after GracefulShutdownTimeout or a second signal
 
+A zero or negative GracefulShutdownTimeout waits for the running requests
+until a second signal.
+
 # Logging
 
-The package uses github.com/domonda/golog for logging. Set a custom logger:
+The package uses github.com/domonda/golog for logging. Set a custom logger,
+for example with a prefix using github.com/domonda/golog/log:
 
-	logger := golog.NewLogger("my-rcom-server")
-	rcom.SetLogger(logger)
+	rcom.SetLogger(log.WithPrefix("my-rcom-server: "))
 
 Pass nil to disable logging:
 
@@ -146,11 +154,12 @@ Commands respect context cancellation and will terminate running processes.
 # Error Handling
 
 Errors are returned with context. Common scenarios:
-- Non-zero exit codes are treated as errors unless in NonErrorExitCodes
-- Command not allowed on server
-- Invalid filenames
-- Context cancellation
-- Timeout expiration
+  - Non-zero exit codes are treated as errors unless in NonErrorExitCodes
+  - Command not allowed on server
+  - Invalid filenames
+  - Context cancellation
+  - Timeout expiration
+  - Exceeded server limits
 
 # Best Practices
 

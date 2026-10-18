@@ -11,6 +11,7 @@ import (
 var (
 	// GracefulShutdownTimeout is how long ListenAndServe waits
 	// for running requests after a termination signal.
+	// Zero or a negative value waits until a second signal.
 	GracefulShutdownTimeout = time.Minute
 
 	// MaxRequestSize is the maximum size in bytes of a request,
@@ -70,7 +71,8 @@ var (
 
 // SetLogger changes the logger used by the package.
 // Passing nil disables logging.
-// The default is github.com/domonda/golog/log.NewPackageLogger("rcom")
+// The default is github.com/domonda/golog/log.NewPackageLogger(),
+// which prefixes messages with "go-rcom: ".
 func SetLogger(l *golog.Logger) {
 	log = l
 }
