@@ -5,8 +5,13 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"io"
 	"net/http"
 )
+
+// maxErrorResponseSize limits how much of an error response
+// ExecuteRemotely reads into the returned error
+const maxErrorResponseSize = 64 << 10
 
 // ExecuteRemotely executes a command on a remote rcom server via HTTP.
 //
@@ -24,7 +29,8 @@ import (
 // Returns an error if:
 //   - Command validation fails
 //   - Network request fails
-//   - Server returns non-200 status (e.g., command not allowed)
+//   - Server returns non-200 status (e.g., command not allowed),
+//     the error contains the server's error message
 //   - Response decoding fails
 //
 // The server must be running ListenAndServe with the command allowed.
@@ -55,12 +61,14 @@ func ExecuteRemotely(ctx context.Context, addr string, c *Command) (result *Resu
 	if err != nil {
 		return nil, err
 	}
+	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("rcom.Command: response status %s", response.Status)
+		// The server responds with an error message
+		message, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorResponseSize))
+		return nil, fmt.Errorf("rcom.Command: response status %s: %s", response.Status, bytes.TrimSpace(message))
 	}
 
-	defer response.Body.Close()
 	err = gob.NewDecoder(response.Body).Decode(&result)
 	if err != nil {
 		return nil, err
