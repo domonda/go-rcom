@@ -69,7 +69,9 @@ The server implements several security measures:
   - Separate working directory: Each command runs in its own temporary directory,
     which is not a sandbox
   - Subprocess cleanup: Child processes are killed on context cancellation
-  - Limits: MaxRequestSize and MaxConcurrentCommands
+  - Limits: MaxRequestSize and MaxConcurrentCommands. They do not bound memory
+    against malicious clients, because requests are gob-decoded before the
+    command name is checked, and commands have no time or output size limit.
 
 The server has no authentication, run it in a private network.
 

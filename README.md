@@ -19,6 +19,8 @@ Go package for executing remote CLI commands with input/output file support over
 
 ## Installation
 
+Requires Go 1.26 or later.
+
 ```bash
 go get github.com/domonda/go-rcom
 ```
@@ -282,7 +284,8 @@ err := rcom.ListenAndServe(8080, false, "convert")
 
 With graceful shutdown, `ListenAndServe` returns `http.ErrServerClosed`
 after the running requests have finished. Requests still running after
-`GracefulShutdownTimeout` are canceled:
+`GracefulShutdownTimeout`, or when a second signal arrives, are canceled
+and `ListenAndServe` returns the shutdown error:
 
 ```go
 rcom.GracefulShutdownTimeout = 2 * time.Minute
@@ -346,7 +349,8 @@ Each command execution gets a unique temporary directory:
    arguments can't read or write files outside of the working directory
    in a harmful way, or validate them in front of the server.
 2. **No Path Traversal**: Input file names cannot contain path separators,
-   also not URL-encoded, and are written through an `os.Root` of the working directory
+   also not URL-encoded, cannot be `.` or `..`, contain NUL or exceed 255 bytes,
+   and are written through an `os.Root` of the working directory
 3. **Separate Working Directory**: Each command runs in its own temporary directory.
    This is not a sandbox: the command runs with the permissions of the server process
 4. **Subprocess Cleanup**: Child processes are killed on cancellation
@@ -358,7 +362,8 @@ Each command execution gets a unique temporary directory:
    `MaxRequestSize` and `MaxConcurrentCommands` do not bound memory use
    against malicious clients, and commands have no time or output size limit.
    A command keeps running if its client disconnects after sending more data
-   than the request; a graceful shutdown still cancels it
+   than the request, until it finishes or a graceful shutdown cancels it
+   after `GracefulShutdownTimeout` or a second signal
 
 ## Error Handling
 
@@ -366,6 +371,9 @@ All errors are returned with context. Common error scenarios:
 
 - **Command not allowed**: Server rejects command not in whitelist
 - **Invalid filenames**: Filenames with path separators are rejected
+- **Duplicate filenames**: `Client` rejects input files with the same base name.
+  File names that differ only in case are rejected on case-insensitive file systems,
+  like on macOS and Windows, by the server with 400
 - **Request too large**: Requests larger than `MaxRequestSize` are rejected with 413
 - **Invalid request**: Invalid commands and data after the command are rejected with 400
 - **Shutting down**: Requests waiting for a command slot are rejected with 503
