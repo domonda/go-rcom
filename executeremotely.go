@@ -10,7 +10,8 @@ import (
 
 // maxErrorResponseSize limits how much of an error response
 // ExecuteRemotely reads into the returned error
-const maxErrorResponseSize = 64 << 10
+// and is larger than the output of a failed command in errors
+const maxErrorResponseSize = 128 << 10
 
 // ExecuteRemotely executes a command on a remote rcom server via HTTP.
 //

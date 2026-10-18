@@ -44,6 +44,13 @@ var (
 	// Zero or a negative value means no timeout.
 	StallTimeout = time.Minute
 
+	// MinTransferRate is the minimum average rate in bytes per second
+	// at which ListenAndServe receives a request and sends a response,
+	// starting after StallTimeout, so that slow clients
+	// can't hold connections and memory for long.
+	// Zero or a negative value, or no StallTimeout, means no minimum.
+	MinTransferRate int64 = 16 << 10
+
 	// MaxOutputSize is the maximum number of bytes that a command
 	// executed by ExecuteLocally may write to stdout and stderr together.
 	// A command writing more is killed and an error is returned.

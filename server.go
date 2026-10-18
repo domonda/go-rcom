@@ -78,17 +78,17 @@ func newServer(port uint16, allowedCMDs []string) *http.Server {
 // or when a second signal is received, are canceled, and the shutdown
 // error is returned after their handlers have cleaned up.
 func serveUntilSignal(server *http.Server, listener net.Listener, signals <-chan os.Signal, timeout time.Duration) error {
-	// Track the handlers to wait for their cleanup
-	// after their requests have been canceled
-	var handlers sync.WaitGroup
+	// Track the handlers to wait for them, because Shutdown does not
+	// wait for hijacked connections, and for their cleanup after
+	// their requests have been canceled
+	var handlers activeHandlers
 	handler := server.Handler
 	server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handlers.Add(1)
-		defer handlers.Done()
+		handlers.add()
+		defer handlers.done()
 		handler.ServeHTTP(w, r)
 	})
-	// Closing a connection does not cancel its request in every case,
-	// for example not after the client sent more data after the body,
+	// Server.Close does not close hijacked connections,
 	// so the contexts of all requests are canceled explicitly
 	requestsCtx, cancelRequests := context.WithCancel(context.Background())
 	defer cancelRequests()
@@ -124,7 +124,7 @@ func serveUntilSignal(server *http.Server, listener net.Listener, signals <-chan
 	if err == nil {
 		// Shutdown does not wait for the requests
 		// whose connections have been hijacked
-		err = waitContext(ctx, &handlers)
+		err = handlers.wait(ctx)
 	}
 	if err != nil {
 		log.Error("Server shutdown error").Err(err).Log()
@@ -134,7 +134,7 @@ func serveUntilSignal(server *http.Server, listener net.Listener, signals <-chan
 		server.Close()
 		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), handlerCleanupTimeout)
 		defer cancelCleanup()
-		if waitContext(cleanupCtx, &handlers) != nil {
+		if handlers.wait(cleanupCtx) != nil {
 			log.Error("Handlers still running after shutdown").Log()
 		}
 		return fmt.Errorf("rcom server shutdown: %w", err)
@@ -142,15 +142,44 @@ func serveUntilSignal(server *http.Server, listener net.Listener, signals <-chan
 	return http.ErrServerClosed
 }
 
-// waitContext waits for wg or returns the error of ctx if it ends first
-func waitContext(ctx context.Context, wg *sync.WaitGroup) error {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
+// activeHandlers counts running handlers. Unlike a sync.WaitGroup
+// it allows handlers to start while another goroutine waits.
+type activeHandlers struct {
+	mu   sync.Mutex
+	n    int
+	idle chan struct{} // Closed when n drops to zero
+}
+
+func (a *activeHandlers) add() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.n == 0 {
+		a.idle = make(chan struct{})
+	}
+	a.n++
+}
+
+func (a *activeHandlers) done() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.n--
+	if a.n == 0 {
+		close(a.idle)
+	}
+}
+
+// wait waits until no handler is running
+// or returns the error of ctx if it ends first
+func (a *activeHandlers) wait(ctx context.Context) error {
+	a.mu.Lock()
+	if a.n == 0 {
+		a.mu.Unlock()
+		return nil
+	}
+	idle := a.idle
+	a.mu.Unlock()
 	select {
-	case <-done:
+	case <-idle:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -167,6 +196,10 @@ const (
 	// handlerCleanupTimeout is how long a canceled shutdown
 	// waits for the handlers of canceled requests to clean up
 	handlerCleanupTimeout = 10 * time.Second
+
+	// maxLogCommandLength is the maximum length in bytes
+	// of a command line in a log message
+	maxLogCommandLength = 1 << 10
 )
 
 type service struct {
@@ -179,8 +212,14 @@ type service struct {
 	maxCommandDuration time.Duration
 
 	// stallTimeout limits how long reading the request
-	// or writing the response may stall if greater than zero
-	stallTimeout time.Duration
+	// or writing the response may stall if greater than zero,
+	// and after that time minTransferRate applies
+	stallTimeout    time.Duration
+	minTransferRate int64
+
+	// inflight limits the number of requests with a command
+	// running or its result being sent to its capacity if not nil
+	inflight chan struct{}
 
 	// running limits the number of concurrently executed
 	// commands to its capacity if not nil
@@ -202,6 +241,7 @@ func newService(allowedCMDs []string) *service {
 		maxRequestSize:     MaxRequestSize,
 		maxCommandDuration: MaxCommandDuration,
 		stallTimeout:       StallTimeout,
+		minTransferRate:    MinTransferRate,
 		shuttingDown:       make(chan struct{}),
 	}
 	for _, cmd := range allowedCMDs {
@@ -209,13 +249,21 @@ func newService(allowedCMDs []string) *service {
 	}
 	if MaxConcurrentCommands > 0 {
 		s.running = make(chan struct{}, MaxConcurrentCommands)
+		// The results of as many commands as are running
+		// can be in memory while they are sent to slow clients
+		s.inflight = make(chan struct{}, 2*MaxConcurrentCommands)
 	}
 	return s
 }
 
+// transferLimits returns the limits for one request or response
+func (s *service) transferLimits() transferLimits {
+	return transferLimits{timeout: s.stallTimeout, minRate: s.minTransferRate}
+}
+
 func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	resp := &response{w: w, stallTimeout: s.stallTimeout}
+	resp := &response{w: w, transfer: s.transferLimits()}
 
 	command, status, err := s.readCommand(w, r)
 	if err != nil {
@@ -223,8 +271,17 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := resp.hijackConnection(r)
+	ctx, cancel := resp.hijackConnection(r.Context())
 	defer cancel()
+	defer resp.close()
+
+	// Hold an inflight slot until the result has been sent
+	err = s.acquire(ctx, s.inflight)
+	if err != nil {
+		resp.error(http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	defer release(s.inflight)
 
 	result, callID, err := s.execute(ctx, command)
 	switch {
@@ -241,7 +298,7 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Err(err).
 			UUID("callID", callID).
 			Log()
-		resp.error(http.StatusInternalServerError, fmt.Sprintf("%s\n\n%s", command, err))
+		resp.error(http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -261,18 +318,11 @@ func (s *service) readCommand(w http.ResponseWriter, r *http.Request) (command *
 		r.Body = http.MaxBytesReader(w, r.Body, s.maxRequestSize)
 	}
 	controller := http.NewResponseController(w)
-	body := bufio.NewReader(&stallReader{r: r.Body, setDeadline: controller.SetReadDeadline, timeout: s.stallTimeout})
+	body := bufio.NewReader(&stallReader{r: r.Body, setDeadline: controller.SetReadDeadline, transfer: s.transferLimits()})
 
 	command, err = readWireCommand(body)
 	if err == nil {
-		// The request body must end after the command because
-		// the server cancels the requests of closed connections
-		// only after their body has been read completely
-		if _, err = body.Peek(1); err == nil {
-			err = errors.New("rcom.Command: unexpected data after the command")
-		} else if err == io.EOF {
-			err = nil
-		}
+		err = checkBodyEnd(body)
 	}
 	if err != nil {
 		log.Error("can't decode command request").
@@ -299,9 +349,54 @@ func (s *service) readCommand(w http.ResponseWriter, r *http.Request) (command *
 	return command, http.StatusOK, nil
 }
 
-// errNoCommandSlot is returned by service.execute if the request
-// was canceled or the server shut down while waiting for a free command slot
+// checkBodyEnd returns an error if the request body continues after
+// the command, because the server cancels the request of a closed
+// connection only after its body has been read completely
+func checkBodyEnd(body *bufio.Reader) error {
+	_, err := body.Peek(1)
+	switch {
+	case err == io.EOF:
+		return nil
+	case err != nil:
+		return err
+	default:
+		return errors.New("rcom.Command: unexpected data after the command")
+	}
+}
+
+// errNoCommandSlot is returned by service.acquire if the request
+// was canceled or the server shut down while waiting for a free slot
 var errNoCommandSlot = errors.New("no free slot for running commands")
+
+// acquire takes a slot of slots, which can be nil for no limit,
+// or returns errNoCommandSlot. A free slot is taken also when
+// the server is shutting down, because a select chooses
+// randomly between ready cases.
+func (s *service) acquire(ctx context.Context, slots chan struct{}) error {
+	if slots == nil {
+		return nil
+	}
+	select {
+	case slots <- struct{}{}:
+		return nil
+	default:
+	}
+	select {
+	case slots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("%w: request canceled while waiting", errNoCommandSlot)
+	case <-s.shuttingDown:
+		return fmt.Errorf("%w: server is shutting down", errNoCommandSlot)
+	}
+}
+
+// release releases a slot taken by acquire
+func release(slots chan struct{}) {
+	if slots != nil {
+		<-slots
+	}
+}
 
 // execute executes the command locally. If the number of concurrent
 // commands is limited, it waits for a free slot and releases it when
@@ -310,27 +405,17 @@ var errNoCommandSlot = errors.New("no free slot for running commands")
 // Waiting requests are rejected when the server shuts down.
 // Commands are canceled after maxCommandDuration.
 func (s *service) execute(ctx context.Context, command *Command) (*Result, uu.ID, error) {
-	if s.running != nil {
-		// Take a free slot also when the server is shutting down
-		// because a select chooses randomly between ready cases
-		select {
-		case s.running <- struct{}{}:
-		default:
-			select {
-			case s.running <- struct{}{}:
-			case <-ctx.Done():
-				return nil, uu.IDNil, fmt.Errorf("%w: request canceled while waiting", errNoCommandSlot)
-			case <-s.shuttingDown:
-				return nil, uu.IDNil, fmt.Errorf("%w: server is shutting down", errNoCommandSlot)
-			}
-		}
-		defer func() { <-s.running }()
+	err := s.acquire(ctx, s.running)
+	if err != nil {
+		return nil, uu.IDNil, err
 	}
+	defer release(s.running)
+
 	if s.maxCommandDuration > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.maxCommandDuration)
 		defer cancel()
 	}
-	log.Infof("Executing command: %s", command).Log()
+	log.Infof("Executing command: %s", limitString(command.String(), maxLogCommandLength)).Log()
 	return ExecuteLocally(ctx, command)
 }

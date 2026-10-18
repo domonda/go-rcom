@@ -56,3 +56,13 @@ func (c *limitListenerConn) Close() error {
 	c.releaseOnce.Do(c.release)
 	return err
 }
+
+// CloseWrite closes the writing side of a TCP connection,
+// which net/http uses before closing a connection
+// whose request body it did not read
+func (c *limitListenerConn) CloseWrite() error {
+	if closeWriter, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closeWriter.CloseWrite()
+	}
+	return nil
+}

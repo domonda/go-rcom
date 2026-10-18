@@ -111,4 +111,5 @@ func Test_Client_Execute_notOneCommand(t *testing.T) {
 func Test_Client_addr(t *testing.T) {
 	assert.Equal(t, "http://localhost:3666", NewClient(ClientWithHost("localhost"), ClientWithPort(3666)).addr())
 	assert.Equal(t, "http://[::1]:3666", NewClient(ClientWithHost("::1"), ClientWithPort(3666)).addr())
+	assert.Equal(t, "http://[::1]:3666", NewClient(ClientWithHost("[::1]"), ClientWithPort(3666)).addr(), "bracketed host")
 }

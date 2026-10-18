@@ -1,6 +1,7 @@
 package rcom
 
 import (
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -61,4 +62,25 @@ func Test_newLimitListener_noLimit(t *testing.T) {
 	require.NoError(t, err)
 	defer tcpListener.Close()
 	assert.Equal(t, tcpListener, newLimitListener(tcpListener, 0))
+}
+
+func Test_limitListenerConn_CloseWrite(t *testing.T) {
+	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	listener := newLimitListener(tcpListener, 1)
+	defer listener.Close()
+
+	client, err := net.Dial("tcp", tcpListener.Addr().String())
+	require.NoError(t, err)
+	defer client.Close()
+	conn, err := listener.Accept()
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// net/http half-closes connections through this interface
+	closeWriter, ok := conn.(interface{ CloseWrite() error })
+	require.True(t, ok, "CloseWrite of the TCP connection is available")
+	require.NoError(t, closeWriter.CloseWrite())
+	_, err = client.Read(make([]byte, 1))
+	assert.ErrorIs(t, err, io.EOF)
 }

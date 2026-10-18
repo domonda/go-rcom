@@ -64,8 +64,10 @@ func (c *Client) ExecuteWithCommand(ctx context.Context, cmd string, cmdArgs []s
 }
 
 // addr returns the server URL, with brackets around an IPv6 host
+// also if the host was configured with them
 func (c *Client) addr() string {
-	return "http://" + net.JoinHostPort(c.host, strconv.Itoa(int(c.port)))
+	host := strings.TrimSuffix(strings.TrimPrefix(c.host, "["), "]")
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(int(c.port)))
 }
 
 // Execute executes the client's only allowed command on the server

@@ -123,8 +123,145 @@ func Test_service_hijackedResponse(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, response.StatusCode)
 	assert.True(t, response.Close, "Connection: close")
+	assert.Equal(t, []string{"chunked"}, response.TransferEncoding, "a body that ends early is detected")
 
 	result, err := readWireResult(response.Body)
 	require.NoError(t, err)
 	assert.Equal(t, "hello\n", result.Stdout)
+}
+
+func Test_transferLimits_deadline(t *testing.T) {
+	assert.True(t, (&transferLimits{}).deadline(1).IsZero(), "no limits")
+
+	limits := transferLimits{timeout: time.Second, minRate: 1000}
+	first := limits.deadline(1)
+	assert.WithinDuration(t, time.Now().Add(time.Second), first, 100*time.Millisecond, "stall deadline")
+
+	// After 1000 bytes the minimum rate allows one more second from the start,
+	// later than the stall deadline
+	limits.done = 3000
+	assert.WithinDuration(t, time.Now().Add(time.Second), limits.deadline(1), 100*time.Millisecond)
+
+	// A transfer behind the minimum rate gets the earlier rate deadline
+	limits.start = time.Now().Add(-10 * time.Second)
+	limits.done = 1000
+	assert.WithinDuration(t, limits.start.Add(2*time.Second), limits.deadline(1), 100*time.Millisecond)
+}
+
+func Test_stallWriter_chunks(t *testing.T) {
+	var deadlines int
+	buf := bytes.NewBuffer(nil)
+	w := &stallWriter{
+		w:           buf,
+		setDeadline: func(time.Time) error { deadlines++; return nil },
+		transfer:    transferLimits{timeout: time.Minute},
+	}
+	n, err := w.Write(make([]byte, 3*stallWriteChunkSize+1))
+	require.NoError(t, err)
+	assert.Equal(t, 3*stallWriteChunkSize+1, n)
+	assert.Equal(t, 4, deadlines, "one deadline per chunk")
+	assert.Equal(t, n, buf.Len())
+}
+
+func Test_service_slowReaderGetsLargeResult(t *testing.T) {
+	// The transfer takes longer than StallTimeout,
+	// but the client never stops receiving for that long
+	svc := &service{allowedCMDs: map[string]bool{"head": true}, stallTimeout: 300 * time.Millisecond}
+	addr, _ := startObservedServer(t, svc)
+
+	conn := sendRawRequest(t, addr, &Command{
+		Name:               "head",
+		Args:               []string{"-c", "20000000", "/dev/zero"},
+		ResultFilePatterns: []string{"none"},
+	})
+	reader := &slowReader{r: conn, chunk: 256 << 10, pause: 20 * time.Millisecond}
+	response, err := http.ReadResponse(bufio.NewReader(reader), nil)
+	require.NoError(t, err)
+	result, err := readWireResult(response.Body)
+	require.NoError(t, err)
+	assert.Len(t, result.Stdout, 20000000)
+}
+
+// slowReader reads at most chunk bytes after every pause
+type slowReader struct {
+	r     io.Reader
+	chunk int
+	pause time.Duration
+}
+
+func (s *slowReader) Read(p []byte) (int, error) {
+	time.Sleep(s.pause)
+	return s.r.Read(p[:min(len(p), s.chunk)])
+}
+
+func Test_service_MinTransferRate(t *testing.T) {
+	svc := &service{
+		allowedCMDs:     map[string]bool{"echo": true},
+		stallTimeout:    200 * time.Millisecond,
+		minTransferRate: 1000,
+	}
+	addr, finished := startObservedServer(t, svc)
+
+	// The client sends one byte every 50 ms, which never stalls
+	// for StallTimeout but stays below MinTransferRate
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = fmt.Fprintf(conn, "POST / HTTP/1.1\r\nHost: rcom\r\nContent-Length: 100000\r\n\r\n")
+	require.NoError(t, err)
+	go func() {
+		for range 200 {
+			if _, err := conn.Write([]byte{0}); err != nil {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+
+	requireFinished(t, finished, "still reading a request slower than MinTransferRate")
+}
+
+func Test_service_lineBreakAfterRequest(t *testing.T) {
+	svc := &service{allowedCMDs: map[string]bool{"sh": true}}
+	addr, _ := startObservedServer(t, svc)
+
+	// HTTP/1.1 tolerates line breaks after a request body,
+	// which must not cancel the command
+	conn := sendRawRequest(t, addr, &Command{Name: "sh", Args: []string{"-c", "sleep 0.2; echo done"}})
+	_, err := conn.Write([]byte("\r\n"))
+	require.NoError(t, err)
+
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	result, err := readWireResult(response.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "done\n", result.Stdout)
+}
+
+func Test_service_inflight(t *testing.T) {
+	svc := &service{
+		allowedCMDs:  map[string]bool{copyCmd(): true},
+		inflight:     make(chan struct{}, 1),
+		shuttingDown: make(chan struct{}),
+	}
+	svc.inflight <- struct{}{} // Another request is sending its result
+	svc.shutdown()
+	command, _ := cpCommand()
+	body := bytes.NewBuffer(nil)
+	require.NoError(t, writeWireCommand(body, command))
+
+	response := httptest.NewRecorder()
+	svc.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/", body))
+	assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+}
+
+func Test_ExecuteRemotely_errorOutputTail(t *testing.T) {
+	server := httptest.NewServer(&service{allowedCMDs: map[string]bool{"sh": true}})
+	defer server.Close()
+
+	command := &Command{Name: "sh", Args: []string{"-c", "yes | head -c 200000; echo last line; exit 1"}}
+	_, err := ExecuteRemotely(t.Context(), server.URL, command)
+	require.Error(t, err)
+	assert.True(t, strings.HasSuffix(err.Error(), "last line"), "error ends with the output tail")
 }

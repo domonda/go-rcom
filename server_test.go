@@ -317,3 +317,21 @@ func (w *slotCheckingWriter) Write(p []byte) (int, error) {
 	}
 	return w.ResponseRecorder.Write(p)
 }
+
+func Test_activeHandlers(t *testing.T) {
+	var handlers activeHandlers
+	require.NoError(t, handlers.wait(t.Context()), "no handlers")
+
+	handlers.add()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	assert.ErrorIs(t, handlers.wait(ctx), context.DeadlineExceeded)
+
+	// Handlers can start while another goroutine waits
+	waited := make(chan error, 1)
+	go func() { waited <- handlers.wait(t.Context()) }()
+	handlers.add()
+	handlers.done()
+	handlers.done()
+	assert.NoError(t, <-waited)
+}
