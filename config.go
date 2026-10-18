@@ -26,6 +26,28 @@ var (
 	// The default is GOMAXPROCS, which follows container CPU limits.
 	MaxConcurrentCommands = runtime.GOMAXPROCS(0)
 
+	// MaxOutputSize is the maximum number of bytes that a command
+	// executed by ExecuteLocally may write to stdout and stderr together.
+	// A command writing more is killed and an error is returned.
+	// Zero or a negative value means no limit.
+	MaxOutputSize int64 = 64 << 20
+
+	// MaxResultFilesSize is the maximum total size in bytes
+	// of the result files that ExecuteLocally reads.
+	// Zero or a negative value means no limit.
+	MaxResultFilesSize int64 = 1 << 30
+
+	// InheritedEnvVars are the environment variables that commands
+	// executed by ExecuteLocally inherit from the process,
+	// so that secrets in the environment of a server don't reach them.
+	// Names are case-insensitive on Windows.
+	// Nil means all variables are inherited.
+	InheritedEnvVars = []string{
+		"PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TZ",
+		"TMPDIR", "TMP", "TEMP", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH",
+		"SYSTEMROOT", "WINDIR", "PATHEXT", "COMSPEC", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES",
+	}
+
 	log = rootlog.NewPackageLogger()
 )
 
