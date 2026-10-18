@@ -16,6 +16,8 @@ func Test_Result_WriteTo(t *testing.T) {
 		Files: map[string][]byte{
 			"output.txt": []byte("result"),
 			"empty.txt":  {},
+			// An empty file decoded from gob
+			"decoded-empty.txt": nil,
 		},
 	}
 
@@ -40,10 +42,12 @@ func Test_Result_WriteTo(t *testing.T) {
 	})
 
 	t.Run("empty result file", func(t *testing.T) {
-		output := dir.Join("empty.txt")
+		for _, name := range []string{"empty.txt", "decoded-empty.txt"} {
+			output := dir.Join(name)
 
-		err := result.WriteTo(output)
-		assert.ErrorContains(t, err, "empty result file: empty.txt")
-		assert.False(t, output.Exists(), "output file is not created")
+			err := result.WriteTo(output)
+			assert.ErrorContains(t, err, "empty result file: "+name)
+			assert.False(t, output.Exists(), "output file is not created")
+		}
 	})
 }

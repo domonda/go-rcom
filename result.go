@@ -38,9 +38,11 @@ type Result struct {
 // Returns an error if the result file doesn't exist or is empty.
 // The file is identified by matching output.Name() against Files keys.
 func (r *Result) WriteTo(output fs.File) error {
-	rf := r.Files[output.Name()]
+	// An empty file has a nil value after gob decoding,
+	// so the key has to be checked for existence
+	rf, ok := r.Files[output.Name()]
 	switch {
-	case rf == nil:
+	case !ok:
 		return fmt.Errorf("no result file: %s, callID=%v", output.Name(), r.CallID)
 	case len(rf) == 0:
 		return fmt.Errorf("empty result file: %s, callID=%v", output.Name(), r.CallID)
