@@ -13,6 +13,7 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -110,8 +111,11 @@ func (c *Cmd) Run(ctx context.Context) (*Result, error) {
 		stderr   strings.Builder
 		combined strings.Builder
 	)
-	c.cmd.Stdout = io.MultiWriter(&stdout, &combined)
-	c.cmd.Stderr = io.MultiWriter(&stderr, &combined)
+	// os/exec copies stdout and stderr in separate goroutines,
+	// so their writes to combined have to be serialized
+	combinedWriter := &lockedWriter{w: &combined}
+	c.cmd.Stdout = io.MultiWriter(&stdout, combinedWriter)
+	c.cmd.Stderr = io.MultiWriter(&stderr, combinedWriter)
 
 	err := c.cmd.Start()
 	if err != nil {
@@ -165,6 +169,18 @@ func (c *Cmd) Run(ctx context.Context) (*Result, error) {
 	}
 
 	return result, nil
+}
+
+// lockedWriter serializes writes to w
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 type Result struct {
