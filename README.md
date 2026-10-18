@@ -256,6 +256,19 @@ for filename, data := range result.Files {
 
 ## Server Configuration
 
+### Standalone Server
+
+`cmd/rcom-server` runs a server with graceful shutdown.
+Pass the port and the allowed commands as arguments:
+
+```bash
+go install github.com/domonda/go-rcom/cmd/rcom-server@latest
+rcom-server 3666 convert ffmpeg
+```
+
+An empty port argument (`rcom-server "" convert`) uses the `PORT`
+environment variable, or 3666 if it is not set.
+
 ### Custom Port
 
 ```go
