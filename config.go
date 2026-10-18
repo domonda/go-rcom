@@ -26,6 +26,23 @@ var (
 	// The default is GOMAXPROCS, which follows container CPU limits.
 	MaxConcurrentCommands = runtime.GOMAXPROCS(0)
 
+	// MaxCommandDuration is the maximum time a command executed
+	// by ListenAndServe may run before it is killed.
+	// Zero or a negative value means no limit.
+	MaxCommandDuration = time.Hour
+
+	// MaxConnections is the maximum number of connections
+	// that ListenAndServe accepts at the same time.
+	// Further connections wait until an accepted one is closed.
+	// Zero or a negative value means no limit.
+	MaxConnections = 256
+
+	// StallTimeout is how long ListenAndServe waits for a client
+	// to send more of its request or to receive more of the response
+	// before closing the connection.
+	// Zero or a negative value means no timeout.
+	StallTimeout = time.Minute
+
 	// MaxOutputSize is the maximum number of bytes that a command
 	// executed by ExecuteLocally may write to stdout and stderr together.
 	// A command writing more is killed and an error is returned.
