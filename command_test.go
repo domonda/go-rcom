@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/gob"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -89,6 +90,8 @@ func Test_Command_Validate(t *testing.T) {
 		"..%5Cinput.txt",
 		"dir%2finput.txt",
 		"%2E%2E",
+		"nul\x00.txt",
+		strings.Repeat("x", 256),
 	}
 	for _, name := range invalidFileNames {
 		command := &Command{Name: copyCmd(), Files: map[string][]byte{name: nil}}

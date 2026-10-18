@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -101,6 +103,50 @@ func Test_serveUntilSignal(t *testing.T) {
 			}
 			assert.Error(t, <-requestErr, "canceled request")
 		})
+	}
+}
+
+func Test_serveUntilSignal_pipelinedData(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sleep")
+	}
+
+	addr, signals, started, finished, served := startSignaledServer(t, time.Millisecond)
+
+	// Send a request and one more byte after its body, which makes
+	// net/http stop watching the connection for being closed
+	body := bytes.NewBuffer(nil)
+	require.NoError(t, gob.NewEncoder(body).Encode(&Command{Name: "sleep", Args: []string{"30"}}))
+	conn, err := net.Dial("tcp", strings.TrimPrefix(addr, "http://"))
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = fmt.Fprintf(conn, "POST / HTTP/1.1\r\nHost: rcom\r\nContent-Length: %d\r\n\r\n%s", body.Len(), body.Bytes())
+	require.NoError(t, err)
+	<-started
+	_, err = conn.Write([]byte("X"))
+	require.NoError(t, err)
+	signals <- syscall.SIGTERM
+
+	assert.ErrorIs(t, <-served, context.DeadlineExceeded)
+	select {
+	case <-finished:
+	default:
+		t.Error("returned before the canceled request was cleaned up")
+	}
+}
+
+func Test_newServer(t *testing.T) {
+	server := newServer(3666, []string{"convert"})
+	assert.Equal(t, ":3666", server.Addr)
+	svc := server.Handler.(*service)
+	assert.Equal(t, map[string]bool{"convert": true}, svc.allowedCMDs)
+
+	// Shutdown rejects requests waiting for a command slot
+	require.NoError(t, server.Shutdown(context.Background()))
+	select {
+	case <-svc.shuttingDown:
+	case <-time.After(5 * time.Second):
+		t.Error("Shutdown did not call service.shutdown")
 	}
 }
 
@@ -205,6 +251,22 @@ func Test_service_limits(t *testing.T) {
 		svc.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/", encodeRequest(t, command)))
 		assert.Equal(t, http.StatusServiceUnavailable, response.Code)
 		assert.Contains(t, response.Body.String(), "shutting down")
+	})
+
+	t.Run("free slot is taken while shutting down", func(t *testing.T) {
+		svc := &service{
+			allowedCMDs:  map[string]bool{copyCmd(): true},
+			running:      make(chan struct{}, 1),
+			shuttingDown: make(chan struct{}),
+		}
+		svc.shutdown()
+
+		// A select between a free slot and the shutdown would choose randomly
+		for range 50 {
+			command, _ := cpCommand()
+			_, _, err := svc.execute(context.Background(), command)
+			require.NoError(t, err)
+		}
 	})
 
 	t.Run("data after the command", func(t *testing.T) {

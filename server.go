@@ -27,11 +27,13 @@ import (
 //   - allowedCMDs: Command names that are allowed to be executed
 //
 // The server receives gob-encoded Command structs via HTTP POST and returns
-// gob-encoded Result structs. Commands not in allowedCMDs are rejected with
-// HTTP 400 Bad Request.
+// gob-encoded Result structs. Commands not in allowedCMDs, invalid commands
+// and requests with data after the Command are rejected with HTTP 400 Bad Request.
 //
 // The server applies MaxRequestSize and MaxConcurrentCommands
 // as they are set when ListenAndServe is called.
+// Requests waiting for a command slot when the server shuts down
+// are rejected with HTTP 503 Service Unavailable.
 //
 // If gracefulShutdown is enabled, the server will on receiving a termination signal:
 //   - Stop accepting new connections
@@ -39,14 +41,7 @@ import (
 //   - Cancel requests still running after GracefulShutdownTimeout,
 //     or when a second signal is received, and return the shutdown error
 func ListenAndServe(port uint16, gracefulShutdown bool, allowedCMDs ...string) error {
-	svc := newService(allowedCMDs)
-	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", port),
-		Handler:           svc,
-		ReadHeaderTimeout: serverReadHeaderTimeout,
-		IdleTimeout:       serverIdleTimeout,
-	}
-	server.RegisterOnShutdown(svc.shutdown)
+	server := newServer(port, allowedCMDs)
 	if !gracefulShutdown {
 		return server.ListenAndServe()
 	}
@@ -60,6 +55,19 @@ func ListenAndServe(port uint16, gracefulShutdown bool, allowedCMDs ...string) e
 		return err
 	}
 	return serveUntilSignal(server, listener, signals, GracefulShutdownTimeout)
+}
+
+// newServer returns the HTTP server for ListenAndServe
+func newServer(port uint16, allowedCMDs []string) *http.Server {
+	svc := newService(allowedCMDs)
+	server := &http.Server{
+		Addr:              fmt.Sprintf(":%d", port),
+		Handler:           svc,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		IdleTimeout:       serverIdleTimeout,
+	}
+	server.RegisterOnShutdown(svc.shutdown)
+	return server
 }
 
 // serveUntilSignal serves on listener until a signal is received,
@@ -77,6 +85,12 @@ func serveUntilSignal(server *http.Server, listener net.Listener, signals <-chan
 		defer handlers.Done()
 		handler.ServeHTTP(w, r)
 	})
+	// Closing a connection does not cancel its request in every case,
+	// for example not after the client sent more data after the body,
+	// so the contexts of all requests are canceled explicitly
+	requestsCtx, cancelRequests := context.WithCancel(context.Background())
+	defer cancelRequests()
+	server.BaseContext = func(net.Listener) context.Context { return requestsCtx }
 
 	served := make(chan error, 1)
 	go func() { served <- server.Serve(listener) }()
@@ -109,6 +123,7 @@ func serveUntilSignal(server *http.Server, listener net.Listener, signals <-chan
 		log.Error("Server shutdown error").Err(err).Log()
 		// Cancel the requests that are still running
 		// and give their handlers time to clean up
+		cancelRequests()
 		server.Close()
 		cleanedUp := make(chan struct{})
 		go func() {
@@ -256,14 +271,20 @@ var errNoCommandSlot = errors.New("no free slot for running commands")
 // Waiting requests are rejected when the server shuts down.
 func (s *service) execute(ctx context.Context, command *Command) (*Result, uu.ID, error) {
 	if s.running != nil {
+		// Take a free slot also when the server is shutting down
+		// because a select chooses randomly between ready cases
 		select {
 		case s.running <- struct{}{}:
-			defer func() { <-s.running }()
-		case <-ctx.Done():
-			return nil, uu.IDNil, fmt.Errorf("%w: request canceled while waiting", errNoCommandSlot)
-		case <-s.shuttingDown:
-			return nil, uu.IDNil, fmt.Errorf("%w: server is shutting down", errNoCommandSlot)
+		default:
+			select {
+			case s.running <- struct{}{}:
+			case <-ctx.Done():
+				return nil, uu.IDNil, fmt.Errorf("%w: request canceled while waiting", errNoCommandSlot)
+			case <-s.shuttingDown:
+				return nil, uu.IDNil, fmt.Errorf("%w: server is shutting down", errNoCommandSlot)
+			}
 		}
+		defer func() { <-s.running }()
 	}
 	log.Infof("Executing command: %s", command).Log()
 	return ExecuteLocally(ctx, command)

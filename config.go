@@ -23,7 +23,8 @@ var (
 	// that ListenAndServe executes at the same time.
 	// Further requests wait until a running command has finished.
 	// Zero or a negative value means no limit.
-	MaxConcurrentCommands = runtime.NumCPU()
+	// The default is GOMAXPROCS, which follows container CPU limits.
+	MaxConcurrentCommands = runtime.GOMAXPROCS(0)
 
 	log = rootlog.NewPackageLogger()
 )

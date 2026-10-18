@@ -12,6 +12,10 @@ import (
 // that a Command file name must not contain
 const fileNameSeparators = `/\`
 
+// maxFileNameLength is the maximum file name length in bytes
+// of common file systems
+const maxFileNameLength = 255
+
 // Command represents a CLI command to be executed with associated input files and configuration.
 // Commands can be executed locally or remotely via the rcom server.
 type Command struct {
@@ -45,8 +49,8 @@ type Command struct {
 // Validate checks that the command is properly configured.
 // Returns an error if:
 //   - Name is empty
-//   - Any filename is empty, "." or "..", or contains path separators,
-//     also in URL-encoded form like "%2F"
+//   - Any filename is empty, "." or "..", longer than 255 bytes,
+//     or contains NUL or path separators, also in URL-encoded form like "%2F"
 //   - Any result file pattern is empty, duplicated or malformed
 func (c *Command) Validate() error {
 	if c.Name == "" {
@@ -86,7 +90,7 @@ func validateFileName(fileName string) error {
 		switch {
 		case name == "":
 			return errors.New("rcom.Command: empty filename")
-		case name == "." || name == "..":
+		case name == "." || name == ".." || strings.ContainsRune(name, 0) || len(name) > maxFileNameLength:
 			return fmt.Errorf("rcom.Command: invalid filename %q", fileName)
 		case strings.ContainsAny(name, fileNameSeparators):
 			return fmt.Errorf("rcom.Command: filename %q must not contain path separators", fileName)
