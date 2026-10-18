@@ -67,3 +67,29 @@ func Test_ExecuteLocally_symlinks(t *testing.T) {
 	assert.NotContains(t, result.Files, "file-link.txt", "symlinked file is not a result file")
 	assert.FileExists(t, outsideFile, "cleanup does not delete through the symlinked dir")
 }
+
+func Test_ExecuteLocally_NonErrorExitCodes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sh")
+	}
+
+	command := &Command{
+		Name:              "sh",
+		Args:              []string{"-c", "echo failed; exit 1"},
+		NonErrorExitCodes: map[int]bool{1: true},
+	}
+
+	// A listed exit code is returned as Result.ExitCode
+	result, _, err := ExecuteLocally(context.Background(), command)
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.ExitCode)
+
+	// Any other non-zero exit code is an error with the exit code and output
+	for _, nonErrorExitCodes := range []map[int]bool{nil, {2: true}} {
+		command.NonErrorExitCodes = nonErrorExitCodes
+		_, _, err = ExecuteLocally(context.Background(), command)
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "exited with code 1")
+		assert.ErrorContains(t, err, "failed")
+	}
+}

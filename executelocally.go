@@ -96,8 +96,8 @@ func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.
 		return nil, callID, err
 	}
 
-	if r.ExitCode != 0 && (c.NonErrorExitCodes != nil || c.NonErrorExitCodes[r.ExitCode] == false) {
-		return nil, callID, fmt.Errorf("%w\nCommand output: %s", err, r.Output)
+	if r.ExitCode != 0 && !c.NonErrorExitCodes[r.ExitCode] {
+		return nil, callID, fmt.Errorf("command %q exited with code %d\nCommand output: %s", c.Name, r.ExitCode, r.Output)
 	}
 
 	files, err := readResultFiles(root, c.ResultFilePatterns)
