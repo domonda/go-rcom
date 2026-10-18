@@ -22,6 +22,10 @@ import (
 // more output than the limit set with Cmd.WithMaxOutputSize
 var ErrOutputTooLarge = errors.New("command output too large")
 
+// killWaitTimeout is how long Run waits, in addition to the WaitDelay,
+// for a process killed because of the canceled context to end
+const killWaitTimeout = 5 * time.Second
+
 type Cmd struct {
 	cmd           *exec.Cmd
 	killSubProc   bool
@@ -148,18 +152,7 @@ func (c *Cmd) Run(ctx context.Context) (*Result, error) {
 		return nil, err
 	}
 
-	done := make(chan error, 2)
-	dontKill := make(chan struct{}, 1)
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			done <- c.kill()
-		case <-dontKill:
-			return
-		}
-	}()
-
+	waited := make(chan error, 1)
 	go func() {
 		err := c.cmd.Wait()
 		c.killSubProcesses()
@@ -176,20 +169,28 @@ func (c *Cmd) Run(ctx context.Context) (*Result, error) {
 		if combinedWriter.exceeded() {
 			err = fmt.Errorf("%w: more than %d bytes", ErrOutputTooLarge, c.maxOutputSize)
 		}
-		dontKill <- struct{}{}
-		done <- err
+		waited <- err
 	}()
 
 	// Wait for either finished command run or canceled context
-	err = <-done
-
-	switch {
-	case ctx.Err() != nil && err != nil:
-		return nil, fmt.Errorf("%s error killing process because of: %w", err, ctx.Err())
-	case ctx.Err() != nil:
+	select {
+	case err = <-waited:
+		if err != nil {
+			return nil, err
+		}
+	case <-ctx.Done():
+		killErr := c.kill()
+		// Wait until the killed process has been reaped so that it
+		// does not run on after Run returned, bounded because
+		// subprocesses that were not killed can keep the output open
+		select {
+		case <-waited:
+		case <-time.After(c.cmd.WaitDelay + killWaitTimeout):
+		}
+		if killErr != nil {
+			return nil, fmt.Errorf("%s error killing process because of: %w", killErr, ctx.Err())
+		}
 		return nil, fmt.Errorf("killed process because of: %w", ctx.Err())
-	case err != nil:
-		return nil, err
 	}
 
 	result := &Result{

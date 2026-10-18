@@ -1,21 +1,16 @@
-//go:build unix && !linux
+//go:build unix
 
 package exec
 
 import "syscall"
 
-func (c *Cmd) setSysProcAttr() {
-	if c.killSubProc {
-		c.cmd.SysProcAttr = &syscall.SysProcAttr{
-			Setsid: true,
-		}
-	}
-}
+// The command is the leader of its own process group (Setsid in setSysProcAttr),
+// so its group can be killed with the negative process ID.
+// See https://medium.com/@felixge/killing-a-child-process-and-all-of-its-children-in-go-54079af94773
 
 func (c *Cmd) kill() error {
-	// See https://medium.com/@felixge/killing-a-child-process-and-all-of-its-children-in-go-54079af94773
 	if c.killSubProc {
-		return syscall.Kill(-c.cmd.Process.Pid, syscall.SIGKILL) // minus sign is on purpose
+		return killProcessGroup(c.cmd.Process.Pid)
 	}
 	return c.cmd.Process.Kill()
 }
@@ -24,6 +19,10 @@ func (c *Cmd) kill() error {
 // of the command after it exited
 func (c *Cmd) killSubProcesses() {
 	if c.killSubProc {
-		_ = syscall.Kill(-c.cmd.Process.Pid, syscall.SIGKILL) // minus sign is on purpose
+		_ = killProcessGroup(c.cmd.Process.Pid)
 	}
+}
+
+func killProcessGroup(pid int) error {
+	return syscall.Kill(-pid, syscall.SIGKILL) // minus sign is on purpose
 }
