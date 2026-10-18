@@ -292,8 +292,10 @@ err := rcom.ListenAndServe(8080, true, "convert")
 ### Request Size and Concurrency
 
 The server rejects requests larger than `MaxRequestSize` (default 1 GiB)
-and executes at most `MaxConcurrentCommands` (default: number of CPUs)
-commands at a time. Further requests wait. Zero means no limit:
+with 413 and executes at most `MaxConcurrentCommands` (default: `GOMAXPROCS`,
+which follows container CPU limits) commands at a time. Further requests wait,
+and are rejected with 503 if the server shuts down while they wait.
+Zero means no limit:
 
 ```go
 rcom.MaxRequestSize = 100 << 20 // 100 MiB
@@ -354,7 +356,9 @@ Each command execution gets a unique temporary directory:
 7. **Untrusted Requests**: Requests are gob-decoded before the command name is checked,
    and gob can allocate much more memory than a request's size.
    `MaxRequestSize` and `MaxConcurrentCommands` do not bound memory use
-   against malicious clients, and commands have no time or output size limit
+   against malicious clients, and commands have no time or output size limit.
+   A command keeps running if its client disconnects after sending more data
+   than the request; a graceful shutdown still cancels it
 
 ## Error Handling
 
@@ -362,7 +366,9 @@ All errors are returned with context. Common error scenarios:
 
 - **Command not allowed**: Server rejects command not in whitelist
 - **Invalid filenames**: Filenames with path separators are rejected
-- **Request too large**: Requests larger than `MaxRequestSize` are rejected
+- **Request too large**: Requests larger than `MaxRequestSize` are rejected with 413
+- **Invalid request**: Invalid commands and data after the command are rejected with 400
+- **Shutting down**: Requests waiting for a command slot are rejected with 503
 - **Non-zero exit codes**: Treated as errors unless in `NonErrorExitCodes`
 - **Missing result files**: `Result.WriteTo` returns error if file not found
 - **Context cancellation**: Commands respect context cancellation

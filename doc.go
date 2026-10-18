@@ -115,9 +115,9 @@ The server supports graceful shutdown when configured:
 	err := rcom.ListenAndServe(8080, true, "convert")
 
 On receiving SIGTERM, SIGINT, or SIGHUP, the server will:
- 1. Stop accepting new requests
+ 1. Stop accepting new requests, reject requests waiting for a command slot with 503
  2. Wait for in-flight requests to complete, then ListenAndServe returns http.ErrServerClosed
- 3. Cancel requests still running after GracefulShutdownTimeout
+ 3. Cancel requests still running after GracefulShutdownTimeout or a second signal
 
 # Logging
 
