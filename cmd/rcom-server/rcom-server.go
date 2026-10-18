@@ -43,6 +43,7 @@ func main() {
 	log.Infof("Listening on port %d, allowed commands: %v", port, allowedCmds).Log()
 	err = rcom.ListenAndServe(port, true, allowedCmds...)
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal("Server error").Err(err).LogAndPanic()
+		log.Error("Server error").Err(err).Log()
+		os.Exit(1)
 	}
 }

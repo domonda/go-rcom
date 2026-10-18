@@ -66,20 +66,41 @@ func Test_serveUntilSignal(t *testing.T) {
 		assert.NoError(t, <-requestErr)
 	})
 
-	t.Run("cancels requests after the timeout", func(t *testing.T) {
-		addr, signals, started, _, served := startSignaledServer(t, time.Millisecond)
+	// Requests still running are canceled and their handlers
+	// have cleaned up when serveUntilSignal returns
+	canceled := map[string]struct {
+		timeout  time.Duration
+		signals  int
+		expected error
+	}{
+		"after the timeout":                     {timeout: time.Millisecond, signals: 1, expected: context.DeadlineExceeded},
+		"after a second signal":                 {timeout: time.Minute, signals: 2, expected: context.Canceled},
+		"after a second signal without timeout": {timeout: 0, signals: 2, expected: context.Canceled},
+	}
+	for name, tc := range canceled {
+		t.Run("cancels requests "+name, func(t *testing.T) {
+			addr, signals, started, finished, served := startSignaledServer(t, tc.timeout)
 
-		requestErr := make(chan error, 1)
-		go func() {
-			_, err := ExecuteRemotely(context.Background(), addr, &Command{Name: "sleep", Args: []string{"10"}})
-			requestErr <- err
-		}()
-		<-started
-		signals <- syscall.SIGTERM
+			requestErr := make(chan error, 1)
+			go func() {
+				_, err := ExecuteRemotely(context.Background(), addr, &Command{Name: "sleep", Args: []string{"10"}})
+				requestErr <- err
+			}()
+			<-started
+			for range tc.signals {
+				// Blocks until the previous signal was received
+				signals <- syscall.SIGTERM
+			}
 
-		assert.ErrorIs(t, <-served, context.DeadlineExceeded)
-		assert.Error(t, <-requestErr, "canceled request")
-	})
+			assert.ErrorIs(t, <-served, tc.expected)
+			select {
+			case <-finished:
+			default:
+				t.Error("returned before the canceled request was cleaned up")
+			}
+			assert.Error(t, <-requestErr, "canceled request")
+		})
+	}
 }
 
 func Test_ListenAndServe_portInUse(t *testing.T) {
@@ -148,6 +169,16 @@ func Test_service_limits(t *testing.T) {
 		assert.Empty(t, svc.running, "slot is released")
 	})
 
+	t.Run("slot is released before the result is sent", func(t *testing.T) {
+		svc := &service{allowedCMDs: map[string]bool{copyCmd(): true}, running: make(chan struct{}, 1)}
+		command, _ := cpCommand()
+
+		response := &slotCheckingWriter{ResponseRecorder: httptest.NewRecorder(), svc: svc}
+		svc.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/", encodeRequest(t, command)))
+		require.Equal(t, http.StatusOK, response.Code)
+		assert.False(t, response.slotTakenWhileWriting, "a slow client would block other commands")
+	})
+
 	t.Run("invalid command", func(t *testing.T) {
 		svc := &service{allowedCMDs: map[string]bool{copyCmd(): true}}
 		command, _ := cpCommand()
@@ -164,4 +195,19 @@ func Test_service_limits(t *testing.T) {
 		(&service{}).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString("not gob")))
 		assert.Equal(t, http.StatusBadRequest, response.Code)
 	})
+}
+
+// slotCheckingWriter records if a command slot of svc
+// is taken while the response is written
+type slotCheckingWriter struct {
+	*httptest.ResponseRecorder
+	svc                   *service
+	slotTakenWhileWriting bool
+}
+
+func (w *slotCheckingWriter) Write(p []byte) (int, error) {
+	if len(w.svc.running) > 0 {
+		w.slotTakenWhileWriting = true
+	}
+	return w.ResponseRecorder.Write(p)
 }
