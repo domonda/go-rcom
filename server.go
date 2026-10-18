@@ -3,6 +3,7 @@ package rcom
 import (
 	"context"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -24,21 +25,20 @@ import (
 // gob-encoded Result structs. Commands not in allowedCMDs are rejected with
 // HTTP 400 Bad Request.
 //
+// The server applies MaxRequestSize and MaxConcurrentCommands
+// as they are set when ListenAndServe is called.
+//
 // If gracefulShutdown is enabled, the server will on receiving a termination signal:
 //   - Stop accepting new connections
 //   - Wait for in-flight requests to complete, then return http.ErrServerClosed
 //   - Cancel requests still running after GracefulShutdownTimeout
 //     and return the shutdown error
 func ListenAndServe(port uint16, gracefulShutdown bool, allowedCMDs ...string) error {
-	cmds := make(map[string]bool)
-	for _, cmd := range allowedCMDs {
-		cmds[cmd] = true
-	}
-	svc := &service{allowedCMDs: cmds}
-
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
-		Handler: svc,
+		Addr:              fmt.Sprintf(":%d", port),
+		Handler:           newService(allowedCMDs),
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		IdleTimeout:       serverIdleTimeout,
 	}
 	if !gracefulShutdown {
 		return server.ListenAndServe()
@@ -86,12 +86,45 @@ func serveUntilSignal(server *http.Server, listener net.Listener, signals <-chan
 	return http.ErrServerClosed
 }
 
+const (
+	// Timeouts of the server started by ListenAndServe.
+	// There is no timeout for reading the request body
+	// because input files can be large.
+	serverReadHeaderTimeout = 10 * time.Second
+	serverIdleTimeout       = 2 * time.Minute
+)
+
 type service struct {
 	allowedCMDs map[string]bool
+
+	// maxRequestSize limits the request size if greater than zero
+	maxRequestSize int64
+
+	// running limits the number of concurrently executed
+	// commands to its capacity if not nil
+	running chan struct{}
+}
+
+func newService(allowedCMDs []string) *service {
+	s := &service{
+		allowedCMDs:    make(map[string]bool),
+		maxRequestSize: MaxRequestSize,
+	}
+	for _, cmd := range allowedCMDs {
+		s.allowedCMDs[cmd] = true
+	}
+	if MaxConcurrentCommands > 0 {
+		s.running = make(chan struct{}, MaxConcurrentCommands)
+	}
+	return s
 }
 
 func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
+
+	if s.maxRequestSize > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, s.maxRequestSize)
+	}
 
 	var command *Command
 	err := gob.NewDecoder(r.Body).Decode(&command)
@@ -99,13 +132,27 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Error("can't decode command request").
 			Err(err).
 			Log()
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		status := http.StatusBadRequest
+		if _, tooLarge := errors.AsType[*http.MaxBytesError](err); tooLarge {
+			status = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 
 	if !s.allowedCMDs[command.Name] {
 		http.Error(w, fmt.Sprintf("command %q not allowed", command.Name), http.StatusBadRequest)
 		return
+	}
+
+	if s.running != nil {
+		select {
+		case s.running <- struct{}{}:
+			defer func() { <-s.running }()
+		case <-r.Context().Done():
+			http.Error(w, "request canceled while waiting for running commands", http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	log.Infof("Executing command: %s", command).Log()

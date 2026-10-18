@@ -54,7 +54,7 @@ func Test_Command_ExecuteLocally(t *testing.T) {
 }
 
 func Test_Command_ExecuteRemotely(t *testing.T) {
-	svc := &service{map[string]bool{copyCmd(): true}}
+	svc := &service{allowedCMDs: map[string]bool{copyCmd(): true}}
 	server := httptest.NewServer(svc)
 	defer server.Close()
 

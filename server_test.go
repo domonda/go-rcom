@@ -1,9 +1,12 @@
 package rcom
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"runtime"
 	"syscall"
@@ -87,4 +90,67 @@ func Test_ListenAndServe_portInUse(t *testing.T) {
 
 	assert.Error(t, ListenAndServe(port, true, "echo"), "graceful")
 	assert.Error(t, ListenAndServe(port, false, "echo"), "not graceful")
+}
+
+func Test_newService(t *testing.T) {
+	defaultMaxRequestSize, defaultMaxConcurrentCommands := MaxRequestSize, MaxConcurrentCommands
+	t.Cleanup(func() { MaxRequestSize, MaxConcurrentCommands = defaultMaxRequestSize, defaultMaxConcurrentCommands })
+
+	MaxRequestSize, MaxConcurrentCommands = 1000, 2
+	svc := newService([]string{"convert", "ffmpeg"})
+	assert.Equal(t, map[string]bool{"convert": true, "ffmpeg": true}, svc.allowedCMDs)
+	assert.Equal(t, int64(1000), svc.maxRequestSize)
+	assert.Equal(t, 2, cap(svc.running))
+
+	MaxConcurrentCommands = 0
+	assert.Nil(t, newService(nil).running, "no concurrency limit")
+}
+
+func Test_service_limits(t *testing.T) {
+	encodeRequest := func(t *testing.T, command *Command) *bytes.Buffer {
+		t.Helper()
+		body := bytes.NewBuffer(nil)
+		require.NoError(t, gob.NewEncoder(body).Encode(command))
+		return body
+	}
+
+	t.Run("request too large", func(t *testing.T) {
+		svc := &service{allowedCMDs: map[string]bool{copyCmd(): true}, maxRequestSize: 100}
+		command, _ := cpCommand()
+		command.Files["large.txt"] = make([]byte, 1000)
+
+		response := httptest.NewRecorder()
+		svc.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/", encodeRequest(t, command)))
+		assert.Equal(t, http.StatusRequestEntityTooLarge, response.Code)
+	})
+
+	t.Run("canceled while all commands are running", func(t *testing.T) {
+		svc := &service{allowedCMDs: map[string]bool{copyCmd(): true}, running: make(chan struct{}, 1)}
+		svc.running <- struct{}{} // Another command is running
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		command, _ := cpCommand()
+		request := httptest.NewRequestWithContext(ctx, http.MethodPost, "/", encodeRequest(t, command))
+
+		response := httptest.NewRecorder()
+		svc.ServeHTTP(response, request)
+		assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+	})
+
+	t.Run("runs when a command slot is free", func(t *testing.T) {
+		svc := &service{allowedCMDs: map[string]bool{copyCmd(): true}, running: make(chan struct{}, 1)}
+		command, _ := cpCommand()
+
+		response := httptest.NewRecorder()
+		svc.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/", encodeRequest(t, command)))
+		assert.Equal(t, http.StatusOK, response.Code)
+		assert.Empty(t, svc.running, "slot is released")
+	})
+
+	t.Run("invalid request body", func(t *testing.T) {
+		response := httptest.NewRecorder()
+		(&service{}).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString("not gob")))
+		assert.Equal(t, http.StatusBadRequest, response.Code)
+	})
 }
