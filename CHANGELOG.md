@@ -27,16 +27,34 @@ Security sections compare with the earlier untagged builds.
 - `RemoteExecutor` joins `LocalExecutor` as an `Executor`, so code can switch
   between local and remote execution.
 - `Client` and `NewClient` with the options `ClientWithHost`,
-  `ClientWithPort`, `ClientWithCmds` and `ClientWithTimeOut`.
+  `ClientWithPort`, `ClientWithCmds`, `ClientWithTimeout` and
+  `ClientWithRetries`, which retries requests that did not reach the server
+  or got 502, 503 or 504, but not failed commands. `ClientWithTimeOut` is a
+  deprecated alias of `ClientWithTimeout`.
+- `Client.Cmd` builds a command with `WithArgs`, `WithStringArgs`,
+  `WithFiles`, `WithStdin`, `WithEnv`, `WithResultFilePatterns` and
+  `WithNonErrorExitCodes` and executes it with `Run`, the API of the
+  domonda-service rcom package. `WithArgs` sends `fs.FileReader` arguments
+  as input files.
+- `Command.Env` sets environment variables for a command; the server only
+  accepts the `AllowedCommandEnvVars`.
+- `Result.FileData` and `Result.MemFile` return a result file, and
+  `ExecuteRemotely` returns server errors as `*ResponseError`.
+- `GET /health` responds with 200 OK, and the `X-Request-ID` header is passed
+  on from the golog `requestID` of the client's context to the server's logs
+  and response.
 - `ListenAndServe` serves the whitelisted command names (their arguments are
   not restricted) with optional graceful shutdown on SIGTERM, SIGINT and
   SIGHUP. `SetLogger` replaces the package logger.
 - Server limits: `MaxRequestSize` (default 1 GiB, larger requests get HTTP
   413), `MaxConnections` (256, further connections wait), `StallTimeout`
   (1 minute without the client sending or receiving ends the request),
-  `MaxConcurrentCommands` (`GOMAXPROCS`, further requests wait) and
-  `MaxCommandDuration` (1 hour). The server also sets header read and idle
-  timeouts, and cancels a command when its client closes the connection.
+  `MinTransferRate` (16 KiB/s after `StallTimeout`), `MaxConcurrentCommands`
+  (`GOMAXPROCS`, further requests wait) and `MaxCommandDuration` (1 hour).
+  At most twice `MaxConcurrentCommands` requests hold results in memory while
+  sending them, and commands have at most 10000 files. The server also sets
+  header read and idle timeouts, and cancels a command when its client
+  closes the connection.
 - `ExecuteLocally` limits: `MaxOutputSize` (64 MiB of stdout and stderr, the
   command is killed above) and `MaxResultFilesSize` (1 GiB). It stops waiting
   for the output 2 s after the command exited, and errors contain only the
@@ -44,13 +62,16 @@ Security sections compare with the earlier untagged builds.
 - `InheritedEnvVars` lists the environment variables commands inherit.
 - `pkg/exec` wraps `os/exec` with builder methods, can kill a command's
   subprocesses when its context is canceled or after it exited, and has
-  `WithWaitDelay` and `WithMaxOutputSize`. It also builds on the BSDs.
+  `WithWaitDelay` and `WithMaxOutputSize`. `Run` returns after a killed
+  process has ended. It also builds on the BSDs.
+- `rcom-server` checks at the start that the allowed commands are installed.
 
 ### Changed
 
-- **Breaking:** the gob wire format sends files and exit codes as slices
-  instead of maps, so clients and servers of this release can't talk to
-  earlier untagged builds.
+- **Breaking:** commands and results are sent as a stream of gob messages, a
+  header of at most 1 MiB and one message per file, so clients and servers of
+  this release can't talk to earlier untagged builds or to the domonda-service
+  rcom package. Successful responses use chunked encoding.
 - **Breaking:** commands only inherit the `InheritedEnvVars` (`PATH`,
   `HOME`, locale, temp dir and library path variables) instead of the whole
   environment. Set it to nil to inherit all variables.
@@ -76,10 +97,14 @@ Security sections compare with the earlier untagged builds.
 - The server answers invalid commands and requests with data after the
   command with 400, and requests waiting for a command slot during shutdown
   with 503.
-- Result files are regular files only; symlinks, directories and files with
-  more than one hard link in the working directory are skipped.
+- Result files are regular files only, checked on the opened file; symlinks,
+  directories, FIFOs and hard links to files outside of the working directory
+  are skipped.
 - The working directory is created with mode 0700 and input files with 0600,
-  instead of 0771 and 0660.
+  instead of 0771 and 0660 (on unix systems).
+- A command ended by a signal reports it, for example
+  `ended by signal: killed`.
+- Requests other than POST and `/health` get 405.
 - Errors of `ExecuteRemotely` contain the server's error message.
 
 ### Fixed
@@ -108,7 +133,8 @@ Security sections compare with the earlier untagged builds.
 - Cleanup no longer deletes through symlinks the command created, and result
   collection no longer follows them out of the working directory.
 - A request of a few hundred bytes could make the server allocate hundreds of
-  MiB, because gob allocates maps from the entry count a message declares.
+  MiB, because gob allocates maps from the entry count a message declares, and
+  slices of empty elements 40 to 80 times their size.
 - Clients that stop sending or receiving held connections and memory
   indefinitely, and a client that disconnected after sending more data than
   its request left its command running.
