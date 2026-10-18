@@ -18,3 +18,11 @@ func (c *Cmd) kill() error {
 	}
 	return c.cmd.Process.Kill()
 }
+
+// killSubProcesses kills the processes left in the process group
+// of the command after it exited
+func (c *Cmd) killSubProcesses() {
+	if c.killSubProc {
+		_ = syscall.Kill(-c.cmd.Process.Pid, syscall.SIGKILL) // minus sign is on purpose
+	}
+}

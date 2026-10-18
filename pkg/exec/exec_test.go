@@ -59,3 +59,17 @@ func TestCmd_WithEnvVar(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, strings.HasPrefix(result.Stdout, "value"), "stdout %q", result.Stdout)
 }
+
+func TestCmd_WithMaxOutputSize(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses yes")
+	}
+
+	// yes writes until it is killed
+	_, err := Command("yes").WithMaxOutputSize(1 << 20).WithKillSubProcesses().Run(context.Background())
+	assert.ErrorIs(t, err, ErrOutputTooLarge)
+
+	result, err := Command("echo", "small").WithMaxOutputSize(1 << 20).Run(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "small\n", result.Output)
+}
