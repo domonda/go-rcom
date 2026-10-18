@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,10 +24,11 @@ import (
 // gob-encoded Result structs. Commands not in allowedCMDs are rejected with
 // HTTP 400 Bad Request.
 //
-// If gracefulShutdown is enabled, the server will:
-//   - Stop accepting new connections on receiving termination signals
-//   - Wait for in-flight requests to complete
-//   - Shutdown after GracefulShutdownTimeout if requests are still running
+// If gracefulShutdown is enabled, the server will on receiving a termination signal:
+//   - Stop accepting new connections
+//   - Wait for in-flight requests to complete, then return http.ErrServerClosed
+//   - Cancel requests still running after GracefulShutdownTimeout
+//     and return the shutdown error
 func ListenAndServe(port uint16, gracefulShutdown bool, allowedCMDs ...string) error {
 	cmds := make(map[string]bool)
 	for _, cmd := range allowedCMDs {
@@ -38,10 +40,50 @@ func ListenAndServe(port uint16, gracefulShutdown bool, allowedCMDs ...string) e
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: svc,
 	}
-	if gracefulShutdown {
-		gracefullyShutdownServerOnSignal(server, GracefulShutdownTimeout)
+	if !gracefulShutdown {
+		return server.ListenAndServe()
 	}
-	return server.ListenAndServe()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	listener, err := net.Listen("tcp", server.Addr)
+	if err != nil {
+		return err
+	}
+	return serveUntilSignal(server, listener, signals, GracefulShutdownTimeout)
+}
+
+// serveUntilSignal serves on listener until a signal is received,
+// then shuts the server down gracefully and returns http.ErrServerClosed
+// after all requests have finished. Requests still running after timeout
+// are canceled and the shutdown error is returned.
+func serveUntilSignal(server *http.Server, listener net.Listener, signals <-chan os.Signal, timeout time.Duration) error {
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(listener) }()
+
+	select {
+	case err := <-served:
+		return err
+	case sig := <-signals:
+		log.Debugf("Received signal %s", sig).Log()
+	}
+
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	err := server.Shutdown(ctx)
+	if err != nil {
+		log.Error("Server shutdown error").Err(err).Log()
+		// Cancel the requests that are still running
+		server.Close()
+		return fmt.Errorf("rcom server shutdown: %w", err)
+	}
+	return http.ErrServerClosed
 }
 
 type service struct {
@@ -86,29 +128,4 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-}
-
-func gracefullyShutdownServerOnSignal(server *http.Server, timeout time.Duration, signals ...os.Signal) {
-	if len(signals) == 0 {
-		signals = []os.Signal{syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM}
-	}
-
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, signals...)
-	go func() {
-		sig := <-shutdown
-		log.Debugf("Received signal %s", sig).Log()
-
-		ctx := context.Background()
-		if timeout > 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, timeout)
-			defer cancel()
-		}
-
-		err := server.Shutdown(ctx)
-		if err != nil {
-			log.Error("Server shutdown error").Err(err).Log()
-		}
-	}()
 }
