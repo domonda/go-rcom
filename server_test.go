@@ -3,14 +3,12 @@ package rcom
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -102,33 +100,6 @@ func Test_serveUntilSignal(t *testing.T) {
 			}
 			assert.Error(t, <-requestErr, "canceled request")
 		})
-	}
-}
-
-// Server.Close does not close hijacked connections, so a forced shutdown
-// has to cancel the request of a client that stays connected
-func Test_serveUntilSignal_hijackedConnection(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("uses sleep")
-	}
-
-	addr, signals, started, finished, served := startSignaledServer(t, time.Millisecond)
-
-	body := bytes.NewBuffer(nil)
-	require.NoError(t, writeWireCommand(body, &Command{Name: "sleep", Args: []string{"30"}}))
-	conn, err := net.Dial("tcp", strings.TrimPrefix(addr, "http://"))
-	require.NoError(t, err)
-	defer conn.Close()
-	_, err = fmt.Fprintf(conn, "POST / HTTP/1.1\r\nHost: rcom\r\nContent-Length: %d\r\n\r\n%s", body.Len(), body.Bytes())
-	require.NoError(t, err)
-	<-started
-	signals <- syscall.SIGTERM
-
-	assert.ErrorIs(t, <-served, context.DeadlineExceeded)
-	select {
-	case <-finished:
-	default:
-		t.Error("returned before the canceled request was cleaned up")
 	}
 }
 

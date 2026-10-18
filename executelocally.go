@@ -79,7 +79,7 @@ func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.
 
 	// Add files to working dir
 	for fileName, fileData := range c.Files {
-		err = writeNewFile(root, fileName, fileData)
+		err = writeNewFile(ctx, root, fileName, fileData)
 		if err != nil {
 			return nil, callID, fmt.Errorf("can't copy file %q because of error: %w", fileName, err)
 		}
@@ -103,10 +103,15 @@ func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.
 	}
 
 	if r.ExitCode != 0 && !c.NonErrorExitCodes[r.ExitCode] {
-		return nil, callID, fmt.Errorf("command %q exited with code %d\nCommand output: %s", c.Name, r.ExitCode, outputTail(r.Output))
+		exit := fmt.Sprintf("exited with code %d", r.ExitCode)
+		if r.ExitCode < 0 {
+			// Ended by a signal, for example "signal: killed"
+			exit = "ended by " + r.ExitState
+		}
+		return nil, callID, fmt.Errorf("command %q %s\nCommand output: %s", c.Name, exit, outputTail(r.Output))
 	}
 
-	files, err := readResultFiles(root, c.ResultFilePatterns, MaxResultFilesSize)
+	files, err := readResultFiles(ctx, root, c.ResultFilePatterns, MaxResultFilesSize)
 	if err != nil {
 		return nil, callID, fmt.Errorf("can't read result files: %w", err)
 	}
@@ -171,26 +176,27 @@ func outputTail(output string) string {
 // of the process can access. It returns an error if the file already
 // exists, which happens for names that differ only in case
 // on case-insensitive file systems.
-func writeNewFile(root *os.Root, name string, data []byte) error {
+func writeNewFile(ctx context.Context, root *os.Root, name string, data []byte) error {
 	file, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
-	_, err = file.Write(data)
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
+	_, err = io.Copy(file, &contextReader{ctx: ctx, r: bytes.NewReader(data)})
+	closeErr := file.Close()
+	if err != nil {
+		return err
 	}
-	return err
+	return closeErr
 }
 
 // readResultFiles reads the regular files in the root directory
 // with a name matching any of the patterns,
 // or all regular files if no patterns are passed.
-// Directories, symlinks, other special files and files with more
-// than one hard link, which could be a file outside of root,
-// are skipped. An error is returned if the files are larger than
+// Directories, symlinks, other special files and hard links
+// to files outside of root are skipped.
+// An error is returned if the files are larger than
 // maxSize bytes together and maxSize is greater than zero.
-func readResultFiles(root *os.Root, patterns []string, maxSize int64) (map[string][]byte, error) {
+func readResultFiles(ctx context.Context, root *os.Root, patterns []string, maxSize int64) (map[string][]byte, error) {
 	dir, err := root.Open(".")
 	if err != nil {
 		return nil, err
@@ -201,62 +207,143 @@ func readResultFiles(root *os.Root, patterns []string, maxSize int64) (map[strin
 		return nil, err
 	}
 
-	files := make(map[string][]byte)
-	var size int64
+	// Count the hard links of the regular files inside of root
+	var names []string
+	linksInRoot := make(map[fileID]uint64)
 	for _, entry := range entries {
 		if !entry.Type().IsRegular() {
 			continue
+		}
+		file, err := openRegularFile(root, entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		if file == nil {
+			continue
+		}
+		links := fileLinkInfo(file)
+		file.Close()
+		if links.known {
+			linksInRoot[links.id]++
 		}
 		match, err := matchAnyPattern(entry.Name(), patterns)
 		if err != nil {
 			return nil, err
 		}
-		if !match {
-			continue
+		if match {
+			names = append(names, entry.Name())
 		}
-		info, err := entry.Info()
+	}
+
+	files := make(map[string][]byte)
+	var size int64
+	for _, name := range names {
+		data, err := readResultFile(ctx, root, name, linksInRoot, maxSize, size)
 		if err != nil {
 			return nil, err
 		}
-		if hardLinkCount(info) > 1 {
-			continue
+		if data != nil {
+			size += int64(len(data))
+			files[name] = data
 		}
-		limit := int64(-1)
-		if maxSize > 0 {
-			limit = maxSize - size
-		}
-		data, err := readFileLimited(root, entry.Name(), limit)
-		if err != nil {
-			return nil, err
-		}
-		if data == nil {
-			return nil, fmt.Errorf("result files larger than %d bytes", maxSize)
-		}
-		size += int64(len(data))
-		files[entry.Name()] = data
 	}
 	return files, nil
 }
 
-// readFileLimited reads the named file in root and returns nil data
-// if it is larger than limit, unless limit is negative
-func readFileLimited(root *os.Root, name string, limit int64) ([]byte, error) {
-	if limit < 0 {
-		return root.ReadFile(name)
-	}
-	file, err := root.Open(name)
-	if err != nil {
+// readResultFile reads the named file in root, checked on the opened
+// file and not on the name that could point to another file by now.
+// It returns nil data for a file that is not regular or has hard
+// links outside of root, and an error if the file would make the
+// result files larger than maxSize, unless maxSize is zero or negative.
+func readResultFile(ctx context.Context, root *os.Root, name string, linksInRoot map[fileID]uint64, maxSize, size int64) ([]byte, error) {
+	file, err := openRegularFile(root, name)
+	if err != nil || file == nil {
 		return nil, err
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+
+	links := fileLinkInfo(file)
+	if links.known && links.count > linksInRoot[links.id] {
+		log.Info("Skipping result file with a hard link outside of the working directory").
+			Str("file", name).
+			Log()
+		return nil, nil
+	}
+
+	limit := int64(-1)
+	if maxSize > 0 {
+		limit = maxSize - size
+	}
+	data, err := readLimited(&contextReader{ctx: ctx, r: file}, limit)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, fmt.Errorf("result files larger than %d bytes", maxSize)
+	}
+	return data, nil
+}
+
+// openRegularFile opens the named file in root without blocking on
+// a FIFO and returns nil if it is not a regular file
+func openRegularFile(root *os.Root, name string) (*os.File, error) {
+	file, err := root.OpenFile(name, os.O_RDONLY|openNonBlock, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		file.Close()
+		return nil, nil
+	}
+	return file, nil
+}
+
+// readLimited reads r and returns nil data if it is
+// longer than limit bytes, unless limit is negative
+func readLimited(r io.Reader, limit int64) ([]byte, error) {
+	if limit < 0 {
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return nil, err
+		}
+		return nonNil(data), nil
+	}
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
 		return nil, err
 	}
 	if int64(len(data)) > limit {
 		return nil, nil
 	}
-	return data, nil
+	return nonNil(data), nil
+}
+
+// nonNil returns an empty slice for nil,
+// so that nil can mean too large in readLimited
+func nonNil(data []byte) []byte {
+	if data == nil {
+		return []byte{}
+	}
+	return data
+}
+
+// contextReader returns the error of ctx when it ends
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c *contextReader) Read(p []byte) (int, error) {
+	err := c.ctx.Err()
+	if err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 func matchAnyPattern(name string, patterns []string) (bool, error) {

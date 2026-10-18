@@ -95,7 +95,8 @@ func (c *Command) Validate() error {
 // too, because some file system libraries decode paths.
 func validateFileName(fileName string) error {
 	names := []string{fileName}
-	if decoded, err := url.PathUnescape(fileName); err == nil && decoded != fileName {
+	decoded, err := url.PathUnescape(fileName)
+	if err == nil && decoded != fileName {
 		names = append(names, decoded)
 	}
 	for _, name := range names {

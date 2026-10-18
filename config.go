@@ -67,10 +67,17 @@ var (
 	// so that secrets in the environment of a server don't reach them.
 	// Names are case-insensitive on Windows.
 	// Nil means all variables are inherited.
+	// Proxy variables are not inherited by default
+	// because their URLs can contain credentials.
 	InheritedEnvVars = []string{
 		"PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TZ",
-		"TMPDIR", "TMP", "TEMP", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH",
-		"SYSTEMROOT", "WINDIR", "PATHEXT", "COMSPEC", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES",
+		"TMPDIR", "TMP", "TEMP", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR",
+		// Windows
+		"SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "PATHEXT", "COMSPEC", "OS", "USERNAME", "USERPROFILE",
+		"HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "ALLUSERSPROFILE", "PUBLIC",
+		"PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+		"COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)", "COMMONPROGRAMW6432",
+		"PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
 	}
 
 	log = rootlog.NewPackageLogger()

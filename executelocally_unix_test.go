@@ -59,15 +59,39 @@ func Test_ExecuteLocally_hardLinks(t *testing.T) {
 	outsideFile := filepath.Join(t.TempDir(), "outside.txt")
 	require.NoError(t, os.WriteFile(outsideFile, []byte("outside"), 0o600))
 
-	// The working dir and outsideFile are in the same temp dir file system
+	// The working dir and outsideFile are in the same temp dir file system.
+	// Hard links between files inside of the working dir are fine.
 	command := &Command{
 		Name: "sh",
-		Args: []string{"-c", `ln "$0" link.txt && echo result > result.txt`, outsideFile},
+		Args: []string{"-c", `ln "$0" link.txt && echo result > result.txt && ln result.txt result2.txt`, outsideFile},
 	}
 	result, _, err := ExecuteLocally(context.Background(), command)
 	require.NoError(t, err)
-	assert.NotContains(t, result.Files, "link.txt", "hard linked file could be outside of the working dir")
+	assert.NotContains(t, result.Files, "link.txt", "hard link to a file outside of the working dir")
 	assert.Equal(t, []byte("result\n"), result.Files["result.txt"])
+	assert.Equal(t, []byte("result\n"), result.Files["result2.txt"])
+}
+
+func Test_ExecuteLocally_fifo(t *testing.T) {
+	// Opening a FIFO for reading would block until it has a writer
+	command := &Command{Name: "sh", Args: []string{"-c", "mkfifo fifo.txt && echo result > result.txt"}}
+	result, _, err := ExecuteLocally(context.Background(), command)
+	require.NoError(t, err)
+	assert.NotContains(t, result.Files, "fifo.txt")
+	assert.Contains(t, result.Files, "result.txt")
+}
+
+func Test_ExecuteLocally_signal(t *testing.T) {
+	_, _, err := ExecuteLocally(context.Background(), &Command{Name: "sh", Args: []string{"-c", "kill -9 $$"}})
+	assert.ErrorContains(t, err, "ended by signal: killed")
+}
+
+func Test_ExecuteLocally_canceledWhileCopyingFiles(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	command, _ := cpCommand()
+	_, _, err := ExecuteLocally(ctx, command)
+	assert.ErrorIs(t, err, context.Canceled)
 }
 
 func Test_ExecuteLocally_InheritedEnvVars(t *testing.T) {
