@@ -107,7 +107,7 @@ func Test_Client_Execute_timeout(t *testing.T) {
 		t.Skip("uses sleep")
 	}
 
-	client := newTestClient(t, "sleep", ClientWithTimeOut(50*time.Millisecond))
+	client := newTestClient(t, "sleep", ClientWithTimeout(50*time.Millisecond))
 	_, err := client.Execute(context.Background(), []string{"10"}, nil)
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 }

@@ -81,7 +81,7 @@ func main() {
         rcom.ClientWithHost("localhost"),
         rcom.ClientWithPort(8080),
         rcom.ClientWithCmds("convert"),
-        rcom.ClientWithTimeOut(30 * time.Second),
+        rcom.ClientWithTimeout(30 * time.Second),
     )
 
     // Prepare input files
@@ -183,12 +183,47 @@ Configure clients with functional options:
 
 ```go
 client := rcom.NewClient(
-    rcom.ClientWithHost("example.com"),    // Set server host
-    rcom.ClientWithPort(8080),             // Set server port
+    rcom.ClientWithHost("example.com"),       // Set server host
+    rcom.ClientWithPort(8080),                // Set server port
     rcom.ClientWithCmds("convert", "ffmpeg"), // Allowed commands
-    rcom.ClientWithTimeOut(60 * time.Second), // Request timeout
+    rcom.ClientWithTimeout(60 * time.Second), // Timeout per command, including retries
+    rcom.ClientWithRetries(5),                // Retries when the server is not reachable
 )
 ```
+
+`ClientWithRetries` retries requests that failed before reaching the server
+or got 502, 503 or 504 as load balancers respond while a server is not available,
+with delays of 1, 1, 2, 3, 5 seconds and so on. Failed commands are not retried.
+A request can fail after reaching the server, so retried commands should be idempotent.
+An error response of the server is returned as `*rcom.ResponseError` with its status code.
+
+The client sends the golog `requestID` of the context as `X-Request-ID` header,
+which the server uses in its logs:
+
+```go
+ctx = golog.ContextWithRequestUUID(ctx, requestID)
+```
+
+### Command Builder
+
+`Client.Cmd` builds a command with its `With` methods and executes it with `Run`.
+`WithArgs` takes strings and `fs.FileReader` like `fs.File` or `fs.MemFile`,
+which are sent as input files and used by their base name as arguments:
+
+```go
+result, err := client.Cmd("tesseract").
+    WithArgs(image, "output", "-l", "eng+deu", "hocr").
+    WithEnv("OMP_THREAD_LIMIT", "1").
+    WithResultFilePatterns("output.hocr").
+    Run(ctx)
+if err != nil {
+    return err
+}
+hocr, err := result.MemFile("output.hocr")
+```
+
+Further methods are `WithStringArgs`, `WithFiles`, `WithStdin`
+and `WithNonErrorExitCodes`.
 
 ### Multiple Commands
 
@@ -272,6 +307,13 @@ rcom-server 3666 convert ffmpeg
 
 An empty port argument (`rcom-server "" convert`) uses the `PORT`
 environment variable, or 3666 if it is not set.
+`rcom-server` exits at the start if an allowed command is not installed.
+
+### Health Checks and Request IDs
+
+`GET /health` responds with 200 OK for load balancer and container health checks.
+The server logs with the `X-Request-ID` header of a request, or a new request ID,
+and returns it in the response.
 
 ### Custom Port
 
@@ -307,9 +349,13 @@ Zero or a negative value means no limit:
 |---|---|---|
 | `MaxRequestSize` | 1 GiB | Larger requests are rejected with 413 |
 | `MaxConnections` | 256 | Further connections wait to be accepted |
-| `StallTimeout` | 1 minute | Ends a request whose client stops sending or receiving |
+| `StallTimeout` | 1 minute | Ends a request whose client sends or receives nothing for that time |
+| `MinTransferRate` | 16 KiB/s | Ends a request whose client sends or receives slower, after `StallTimeout` |
 | `MaxConcurrentCommands` | `GOMAXPROCS` | Further requests wait, and get 503 if the server shuts down |
 | `MaxCommandDuration` | 1 hour | Longer running commands are killed |
+
+At most twice `MaxConcurrentCommands` requests can hold command results in memory
+while they are sent, and commands can have at most 10000 input or result files.
 
 `ExecuteLocally`, which the server uses, also applies:
 
@@ -334,6 +380,12 @@ Add variables a command needs, or set it to nil to inherit all:
 ```go
 rcom.InheritedEnvVars = append(rcom.InheritedEnvVars, "MAGICK_HOME")
 ```
+
+Clients can set variables with `Command.Env` or `ClientCommand.WithEnv`.
+The server only accepts the names in `AllowedCommandEnvVars`
+(`OMP_THREAD_LIMIT`, `OMP_NUM_THREADS`, `MAGICK_THREAD_LIMIT`, `TZ`, `LANG`
+and `LC_ALL` by default), because a variable like `LD_PRELOAD`
+would let a client run any code.
 
 ### Custom Logger
 
@@ -365,11 +417,12 @@ rcom.SetLogger(log.WithPrefix("rcom-server: "))
 
 Each command execution gets a unique temporary directory:
 - Located in system temp dir, accessible only by the user of the process
+  (on unix systems)
 - Named with a UUID v7 (time-sortable)
 - Input files are written here
 - Command executes with this as working directory
-- Result files are read from here, skipping symlinks, directories
-  and files with more than one hard link
+- Result files are read from here, skipping symlinks, directories,
+  other special files and hard links to files outside of the directory
 - Directory is cleaned up after execution
 
 ### Security Considerations
@@ -389,10 +442,12 @@ Each command execution gets a unique temporary directory:
 6. **No Authentication**: The server accepts requests from anyone who can reach
    its port over plain HTTP. Run it in a private network or behind an authenticating proxy
 7. **Untrusted Requests**: Requests are gob-decoded before the command name is checked.
-   The server limits bound the resources a client can use, but gob can allocate
-   up to about 10 MiB per connection before that data arrives,
-   so `MaxConnections` times 10 MiB of memory can be held by slow clients
-8. **Environment**: Commands only inherit the `InheritedEnvVars`
+   The command header is limited to 1 MiB and every file is its own message,
+   but gob can allocate up to about 10 MiB per message before its data arrives,
+   so slow clients can hold up to `MaxConnections` times 10 MiB of memory,
+   for at most `StallTimeout` plus the time `MinTransferRate` allows
+8. **Environment**: Commands only inherit the `InheritedEnvVars`,
+   and clients can only set the `AllowedCommandEnvVars`
 
 ## Error Handling
 
@@ -464,7 +519,7 @@ func convertImage(inputPath, outputPath string) error {
         rcom.ClientWithHost("conversion-server.local"),
         rcom.ClientWithPort(8080),
         rcom.ClientWithCmds("convert"),
-        rcom.ClientWithTimeOut(30 * time.Second),
+        rcom.ClientWithTimeout(30 * time.Second),
     )
 
     inputFile := fs.File(inputPath)
@@ -490,6 +545,33 @@ func main() {
     log.Println("Image converted successfully")
 }
 ```
+
+## Migrating from domonda-service/pkg/rcom
+
+go-rcom is the open source successor of `github.com/domonda/domonda-service/pkg/rcom`.
+The client API of `Client.Cmd` and the server's `ListenAndServe`, `/health`
+endpoint and `X-Request-ID` handling are the same. The differences:
+
+- **Wire format**: go-rcom clients and servers can't talk to the domonda-service
+  package. Deploy the clients and the rcom server together; during a rolling
+  deployment requests between old and new versions fail.
+- **Retries**: the domonda-service client retried every request 5 times,
+  also failed commands with status 500. Use `ClientWithRetries(5)`,
+  which only retries unreachable servers and 502, 503 and 504.
+  `GetRetryCountFunc` has no equivalent; configure the client instead.
+- **Results**: `Result.CombinedOutput` is `Result.Output`,
+  and `Result.WriteFile(ctx, file)` is `Result.WriteTo(file)`.
+  `Result.FileData` and `Result.MemFile` are the same.
+  Call IDs are UUID v7 instead of v4.
+- **Environment**: commands no longer inherit the whole environment of the
+  server, only the `InheritedEnvVars`, and clients can only set the
+  `AllowedCommandEnvVars`. Add the variables your commands need.
+- **Limits**: the server limits above are new. Behind a load balancer, check that
+  `MaxCommandDuration` and the time requests wait for one of the
+  `MaxConcurrentCommands` fit its idle timeout, and that `MaxRequestSize`,
+  `MaxOutputSize` and `MaxResultFilesSize` fit your largest documents.
+- **Cancellation**: a command is killed when its client disconnects,
+  for example when a load balancer times out, instead of running to its end.
 
 ## Testing
 

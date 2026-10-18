@@ -24,6 +24,17 @@ Create a client and execute commands:
 
 	result, err := client.Execute(ctx, []string{"-version"}, nil)
 
+Or build a command, where fs.FileReader arguments are sent as input files:
+
+	result, err := client.Cmd("convert").
+		WithArgs(inputFile, "-resize", "50%", "output.png").
+		WithResultFilePatterns("output.png").
+		Run(ctx)
+
+GET /health on the server responds with 200 OK for health checks,
+and the X-Request-ID header is passed on from the golog requestID
+of the client's context to the server's logs.
+
 # Command Execution
 
 Commands are represented by the Command struct which includes:
@@ -68,14 +79,16 @@ The server implements several security measures:
     contain NUL or path separators, also not URL-encoded. All file access goes
     through an os.Root of the working directory.
   - Separate working directory: Each command runs in its own temporary directory,
-    accessible only by the user of the process, which is not a sandbox
-  - Environment: Commands only inherit the InheritedEnvVars
+    accessible only by the user of the process on unix systems, which is not a sandbox
+  - Environment: Commands only inherit the InheritedEnvVars,
+    and clients can only set the AllowedCommandEnvVars
   - Subprocess cleanup: Child processes are killed on context cancellation
     and after the command exited (not on Windows)
-  - Limits: MaxRequestSize, MaxConnections, StallTimeout, MaxConcurrentCommands,
-    MaxCommandDuration, MaxOutputSize and MaxResultFilesSize. Requests are
-    gob-decoded before the command name is checked, and gob can allocate up to
-    about 10 MiB per connection before that data arrives.
+  - Limits: MaxRequestSize, MaxConnections, StallTimeout, MinTransferRate,
+    MaxConcurrentCommands, MaxCommandDuration, MaxOutputSize and MaxResultFilesSize.
+    Requests are gob-decoded before the command name is checked, the command
+    header is limited to 1 MiB and every file is its own message, but gob can
+    allocate up to about 10 MiB per message before its data arrives.
   - Disconnects: A command is canceled when its client closes the connection
 
 The server has no authentication, run it in a private network.
