@@ -6,6 +6,10 @@ import (
 	"strings"
 )
 
+// fileNameSeparators are the path separators
+// that a Command file name must not contain
+const fileNameSeparators = `/\`
+
 // Command represents a CLI command to be executed with associated input files and configuration.
 // Commands can be executed locally or remotely via the rcom server.
 type Command struct {
@@ -49,7 +53,7 @@ func (c *Command) Validate() error {
 		if fileName == "" {
 			return errors.New("rcom.Command: empty filename")
 		}
-		if strings.ContainsAny(fileName, `/\`) {
+		if strings.ContainsAny(fileName, fileNameSeparators) {
 			return errors.New("rcom.Command: filename must not contain path separators")
 		}
 	}

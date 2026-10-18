@@ -3,6 +3,7 @@ package rcom
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ungerik/go-fs"
@@ -36,7 +37,13 @@ func (c *Client) ExecuteWithCommand(ctx context.Context, cmd string, cmdArgs []s
 			if err != nil {
 				return nil, err
 			}
-			command.Files[file.Name()] = data
+			// Send the file under its base name, also when the name
+			// is a Windows path like the file name of a browser upload
+			name := file.Name()
+			if i := strings.LastIndexAny(name, fileNameSeparators); i >= 0 {
+				name = name[i+1:]
+			}
+			command.Files[name] = data
 		}
 	}
 
