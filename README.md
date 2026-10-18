@@ -13,7 +13,8 @@ Go package for executing remote CLI commands with input/output file support over
 - **Graceful Shutdown**: Server supports graceful shutdown on signals
 - **Command Whitelisting**: Server restricts execution to explicitly allowed commands
 - **Timeout Support**: Configurable timeouts for command execution
-- **Isolated Execution**: Each command runs in a unique temporary directory
+- **Separate Working Directories**: Each command runs in its own temporary directory
+- **Server Limits**: Maximum request size and number of concurrent commands
 - **Context Support**: Full context.Context support for cancellation
 
 ## Installation
@@ -154,7 +155,8 @@ if err != nil {
 
 ### Using Executor Interface
 
-Both local and remote execution implement the `Executor` interface:
+`LocalExecutor` and `RemoteExecutor` implement the `Executor` interface,
+so code can switch between local and remote execution:
 
 ```go
 var exec rcom.Executor
@@ -162,13 +164,8 @@ var exec rcom.Executor
 // Use local execution
 exec = rcom.LocalExecutor()
 
-// Or create a client that implements Executor
-client := rcom.NewClient(
-    rcom.ClientWithHost("localhost"),
-    rcom.ClientWithPort(8080),
-    rcom.ClientWithCmds("convert"),
-)
-// Client implements Executor via ExecuteWithCommand
+// Or execute on an rcom server
+exec = rcom.RemoteExecutor("http://localhost:8080")
 
 result, err := exec.Execute(ctx, cmd)
 ```
@@ -283,10 +280,24 @@ err := rcom.ListenAndServe(8080, false, "convert")
 
 ### Graceful Shutdown Timeout
 
-Configure the timeout for graceful shutdown:
+With graceful shutdown, `ListenAndServe` returns `http.ErrServerClosed`
+after the running requests have finished. Requests still running after
+`GracefulShutdownTimeout` are canceled:
 
 ```go
 rcom.GracefulShutdownTimeout = 2 * time.Minute
+err := rcom.ListenAndServe(8080, true, "convert")
+```
+
+### Request Size and Concurrency
+
+The server rejects requests larger than `MaxRequestSize` (default 1 GiB)
+and executes at most `MaxConcurrentCommands` (default: number of CPUs)
+commands at a time. Further requests wait. Zero means no limit:
+
+```go
+rcom.MaxRequestSize = 100 << 20 // 100 MiB
+rcom.MaxConcurrentCommands = 4
 err := rcom.ListenAndServe(8080, true, "convert")
 ```
 
@@ -323,16 +334,23 @@ Each command execution gets a unique temporary directory:
 - Named with a UUID v7 (time-sortable)
 - Input files are written here
 - Command executes with this as working directory
-- Result files are read from here
+- Result files are read from here, skipping symlinks and directories
 - Directory is cleaned up after execution
 
 ### Security Considerations
 
-1. **Command Whitelisting**: Server only executes explicitly allowed commands
-2. **No Path Traversal**: Filenames cannot contain path separators
-3. **Isolated Execution**: Each command runs in its own temporary directory
+1. **Command Whitelisting**: Server only executes explicitly allowed command names.
+   Arguments are passed through unchanged, so only allow commands whose
+   arguments can't read or write files outside of the working directory
+   in a harmful way, or validate them in front of the server.
+2. **No Path Traversal**: Input file names cannot contain path separators,
+   also not URL-encoded, and are written through an `os.Root` of the working directory
+3. **Separate Working Directory**: Each command runs in its own temporary directory.
+   This is not a sandbox: the command runs with the permissions of the server process
 4. **Subprocess Cleanup**: Child processes are killed on cancellation
 5. **Input Validation**: Commands are validated before execution
+6. **No Authentication**: The server accepts requests from anyone who can reach
+   its port over plain HTTP. Run it in a private network or behind an authenticating proxy
 
 ## Error Handling
 
@@ -340,6 +358,7 @@ All errors are returned with context. Common error scenarios:
 
 - **Command not allowed**: Server rejects command not in whitelist
 - **Invalid filenames**: Filenames with path separators are rejected
+- **Request too large**: Requests larger than `MaxRequestSize` are rejected
 - **Non-zero exit codes**: Treated as errors unless in `NonErrorExitCodes`
 - **Missing result files**: `Result.WriteTo` returns error if file not found
 - **Context cancellation**: Commands respect context cancellation

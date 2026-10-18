@@ -25,3 +25,12 @@ func LocalExecutor() Executor {
 		return result, err
 	})
 }
+
+// RemoteExecutor returns an Executor that executes commands
+// on the rcom server at addr using ExecuteRemotely.
+// The addr includes scheme and port, e.g. "http://localhost:3666".
+func RemoteExecutor(addr string) Executor {
+	return ExecutorFunc(func(ctx context.Context, cmd *Command) (*Result, error) {
+		return ExecuteRemotely(ctx, addr, cmd)
+	})
+}

@@ -5,8 +5,8 @@ Package rcom provides remote command execution over HTTP with file transfer supp
 
 The rcom package allows executing CLI commands on remote servers via HTTP,
 with support for transferring input files, receiving output files, and
-capturing command output. Commands run in isolated temporary directories
-for security and cleanliness.
+capturing command output. Each command runs in its own temporary
+working directory.
 
 # Basic Usage
 
@@ -62,10 +62,16 @@ Result files matching specified patterns are collected and returned:
 # Security
 
 The server implements several security measures:
-- Command whitelisting: Only explicitly allowed commands can be executed
-- Path validation: Filenames cannot contain path separators
-- Isolated execution: Each command runs in a unique temporary directory
-- Subprocess cleanup: Child processes are killed on context cancellation
+  - Command whitelisting: Only explicitly allowed command names can be executed.
+    Arguments are passed through unchanged.
+  - Path validation: Filenames cannot contain path separators, also not URL-encoded,
+    and all file access goes through an os.Root of the working directory
+  - Separate working directory: Each command runs in its own temporary directory,
+    which is not a sandbox
+  - Subprocess cleanup: Child processes are killed on context cancellation
+  - Limits: MaxRequestSize and MaxConcurrentCommands
+
+The server has no authentication, run it in a private network.
 
 # Executor Interface
 
@@ -78,8 +84,8 @@ The Executor interface provides a common abstraction for both local and remote e
 This allows swapping between local and remote execution transparently:
 
 	var exec rcom.Executor
-	exec = rcom.LocalExecutor()         // Local
-	exec = remoteClient                  // Remote (via Client)
+	exec = rcom.LocalExecutor()                     // Local
+	exec = rcom.RemoteExecutor("http://server:8080") // Remote
 
 # Result Handling
 
@@ -109,9 +115,9 @@ The server supports graceful shutdown when configured:
 	err := rcom.ListenAndServe(8080, true, "convert")
 
 On receiving SIGTERM, SIGINT, or SIGHUP, the server will:
-1. Stop accepting new requests
-2. Wait for in-flight requests to complete
-3. Shutdown after timeout if requests are still running
+ 1. Stop accepting new requests
+ 2. Wait for in-flight requests to complete, then ListenAndServe returns http.ErrServerClosed
+ 3. Cancel requests still running after GracefulShutdownTimeout
 
 # Logging
 
@@ -131,7 +137,7 @@ All execution functions support context.Context for cancellation and timeouts:
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	result, err := rcom.ExecuteLocally(ctx, cmd)
+	result, callID, err := rcom.ExecuteLocally(ctx, cmd)
 
 Commands respect context cancellation and will terminate running processes.
 
