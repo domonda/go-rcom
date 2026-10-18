@@ -5,7 +5,8 @@
 //	rcom-server PORT ALLOWED_COMMAND...
 //
 // If PORT is an empty string, the PORT environment variable
-// or the default port 3666 is used.
+// or the default port 3666 is used. Every allowed command
+// must be found in the PATH. GET /health responds with 200 OK.
 package main
 
 import (
@@ -13,6 +14,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 
 	"github.com/domonda/go-rcom"
@@ -27,6 +29,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "rcom-server:", err)
 		fmt.Fprintln(os.Stderr, "usage: rcom-server PORT ALLOWED_COMMAND...")
 		os.Exit(2)
+	}
+
+	err = checkCommands(allowedCmds)
+	if err != nil {
+		log.Error("Allowed command not found").Err(err).Log()
+		os.Exit(1)
 	}
 
 	log.Infof("Listening on port %d, allowed commands: %v", port, allowedCmds).Log()
@@ -55,4 +63,15 @@ func parseArgs(args []string, envPort string) (port uint16, allowedCmds []string
 		return 0, nil, fmt.Errorf("invalid port %q", portStr)
 	}
 	return uint16(p), args[1:], nil
+}
+
+// checkCommands returns an error if a command is not found in the PATH
+func checkCommands(cmds []string) error {
+	for _, cmd := range cmds {
+		_, err := exec.LookPath(cmd)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

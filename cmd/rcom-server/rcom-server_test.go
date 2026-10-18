@@ -26,3 +26,8 @@ func Test_parseArgs(t *testing.T) {
 		assert.Error(t, err, "%q", args)
 	}
 }
+
+func Test_checkCommands(t *testing.T) {
+	assert.NoError(t, checkCommands([]string{"go"}))
+	assert.Error(t, checkCommands([]string{"go", "rcom-command-that-does-not-exist"}))
+}
