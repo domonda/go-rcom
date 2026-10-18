@@ -40,7 +40,7 @@ func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.
 	// Every call gets a UUID
 	callID = uu.IDv7()
 
-	log := log.With().
+	log := log.WithCtx(ctx).With().
 		UUID("callID", callID).
 		Str("command", c.Name).
 		SubLogger()

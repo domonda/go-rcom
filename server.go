@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/domonda/go-types/uu"
+	"github.com/domonda/golog"
 )
 
 // ListenAndServe starts an HTTP server that accepts and executes remote commands.
@@ -24,6 +25,10 @@ import (
 //   - port: The port number to listen on
 //   - gracefulShutdown: If true, enables graceful shutdown on SIGTERM/SIGINT/SIGHUP
 //   - allowedCMDs: Command names that are allowed to be executed
+//
+// GET /health responds with 200 OK for load balancer health checks.
+// The X-Request-ID header of a request is used for logging and returned
+// in the response, or a new request ID if the request has none.
 //
 // The server receives gob-encoded Command structs via HTTP POST and returns
 // gob-encoded Result structs. Commands not in allowedCMDs, invalid commands
@@ -186,6 +191,9 @@ func (a *activeHandlers) wait(ctx context.Context) error {
 	}
 }
 
+// healthPath is the URL path of the health check endpoint
+const healthPath = "/health"
+
 const (
 	// Timeouts of the server started by ListenAndServe.
 	// There is no timeout for reading the request body
@@ -263,15 +271,31 @@ func (s *service) transferLimits() transferLimits {
 
 func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	resp := &response{w: w, transfer: s.transferLimits()}
 
-	command, status, err := s.readCommand(w, r)
+	if r.URL.Path == healthPath {
+		// For load balancers and container health checks
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "rcom: commands are executed with POST requests", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Pass on the request ID of the client or a new one
+	requestID := golog.GetOrCreateRequestUUID(r)
+	ctx := golog.ContextWithRequestUUID(r.Context(), requestID)
+	resp := &response{w: w, transfer: s.transferLimits(), requestID: golog.FormatUUID(requestID)}
+	w.Header().Set("X-Request-ID", resp.requestID)
+
+	command, status, err := s.readCommand(ctx, w, r)
 	if err != nil {
 		resp.error(status, err.Error())
 		return
 	}
 
-	ctx, cancel := resp.hijackConnection(r.Context())
+	ctx, cancel := resp.hijackConnection(ctx)
 	defer cancel()
 	defer resp.close()
 
@@ -294,7 +318,7 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		resp.error(http.StatusBadRequest, err.Error())
 		return
 	case err != nil:
-		log.Error("error while executing command").
+		log.ErrorCtx(ctx, "error while executing command").
 			Err(err).
 			UUID("callID", callID).
 			Log()
@@ -304,7 +328,7 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	err = resp.result(result)
 	if err != nil {
-		log.Error("can't send command result").
+		log.ErrorCtx(ctx, "can't send command result").
 			Err(err).
 			UUID("callID", callID).
 			Log()
@@ -313,7 +337,7 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // readCommand reads the command of the request and returns it if it is
 // allowed and valid, or the error and the HTTP status code to respond with
-func (s *service) readCommand(w http.ResponseWriter, r *http.Request) (command *Command, status int, err error) {
+func (s *service) readCommand(ctx context.Context, w http.ResponseWriter, r *http.Request) (command *Command, status int, err error) {
 	if s.maxRequestSize > 0 {
 		r.Body = http.MaxBytesReader(w, r.Body, s.maxRequestSize)
 	}
@@ -325,7 +349,7 @@ func (s *service) readCommand(w http.ResponseWriter, r *http.Request) (command *
 		err = checkBodyEnd(body)
 	}
 	if err != nil {
-		log.Error("can't decode command request").
+		log.ErrorCtx(ctx, "can't decode command request").
 			Err(err).
 			Log()
 		// The stall deadline stays set for net/http discarding
@@ -416,6 +440,6 @@ func (s *service) execute(ctx context.Context, command *Command) (*Result, uu.ID
 		ctx, cancel = context.WithTimeout(ctx, s.maxCommandDuration)
 		defer cancel()
 	}
-	log.Infof("Executing command: %s", limitString(command.String(), maxLogCommandLength)).Log()
+	log.InfofCtx(ctx, "Executing command: %s", limitString(command.String(), maxLogCommandLength)).Log()
 	return ExecuteLocally(ctx, command)
 }

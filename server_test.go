@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/domonda/golog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -305,4 +306,47 @@ func Test_activeHandlers(t *testing.T) {
 	handlers.done()
 	handlers.done()
 	assert.NoError(t, <-waited)
+}
+
+func Test_service_health(t *testing.T) {
+	response := httptest.NewRecorder()
+	(&service{}).ServeHTTP(response, httptest.NewRequest(http.MethodGet, healthPath, nil))
+	assert.Equal(t, http.StatusOK, response.Code)
+
+	response = httptest.NewRecorder()
+	(&service{}).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	assert.Equal(t, http.StatusMethodNotAllowed, response.Code, "commands need POST")
+	assert.Equal(t, http.MethodPost, response.Header().Get("Allow"))
+}
+
+func Test_service_requestID(t *testing.T) {
+	requestID := golog.UUIDv4()
+	var receivedRequestID string
+	svc := &service{allowedCMDs: map[string]bool{copyCmd(): true}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedRequestID = r.Header.Get("X-Request-ID")
+		svc.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+
+	// ExecuteRemotely passes on the request ID of the context
+	ctx := golog.ContextWithRequestUUID(context.Background(), requestID)
+	command, _ := cpCommand()
+	_, err := ExecuteRemotely(ctx, server.URL, command)
+	require.NoError(t, err)
+	assert.Equal(t, golog.FormatUUID(requestID), receivedRequestID)
+
+	// The server responds with the request ID, or a new one
+	body := bytes.NewBuffer(nil)
+	require.NoError(t, writeWireCommand(body, &Command{Name: "not-allowed"}))
+	request := httptest.NewRequest(http.MethodPost, "/", body)
+	request.Header.Set("X-Request-ID", golog.FormatUUID(requestID))
+	response := httptest.NewRecorder()
+	svc.ServeHTTP(response, request)
+	assert.Equal(t, golog.FormatUUID(requestID), response.Header().Get("X-Request-ID"))
+
+	response = httptest.NewRecorder()
+	svc.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString("x")))
+	_, err = golog.ParseUUID(response.Header().Get("X-Request-ID"))
+	assert.NoError(t, err, "new request ID")
 }

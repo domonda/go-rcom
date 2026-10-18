@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+
+	"github.com/domonda/golog"
 )
 
 // maxErrorResponseSize limits how much of an error response
@@ -34,9 +36,11 @@ const maxErrorResponseSize = 128 << 10
 //   - Response decoding fails
 //
 // The server must be running ListenAndServe with the command allowed.
+// The request ID of a golog context attribute "requestID" is sent
+// to the server as X-Request-ID header.
 // The context is respected for request cancellation and timeout.
 func ExecuteRemotely(ctx context.Context, addr string, c *Command) (result *Result, err error) {
-	log.Debug("ExecuteRemotely").
+	log.DebugCtx(ctx, "ExecuteRemotely").
 		Str("addr", addr).
 		Str("command", c.Name).
 		Log()
@@ -55,6 +59,10 @@ func ExecuteRemotely(ctx context.Context, addr string, c *Command) (result *Resu
 	request, err := http.NewRequestWithContext(ctx, "POST", addr, buf)
 	if err != nil {
 		return nil, err
+	}
+	// Pass on the request ID for the logs of the server
+	if requestID, ok := golog.GetRequestUUIDFromContext(ctx); ok {
+		request.Header.Set("X-Request-ID", golog.FormatUUID(requestID))
 	}
 
 	response, err := http.DefaultClient.Do(request)
