@@ -27,14 +27,15 @@ func cpCommand() (command *Command, expectedFile fs.MemFile) {
 func Test_GobCommand(t *testing.T) {
 	buf := bytes.NewBuffer(nil)
 
-	// gob.Register(&fs.MemFile{}) // Using []fs.FileReader for Command.File does not work
-
+	// Commands are sent as wireCommand
 	encoded, _ := cpCommand()
-	err := gob.NewEncoder(buf).Encode(encoded)
+	err := gob.NewEncoder(buf).Encode(newWireCommand(encoded))
 	assert.NoError(t, err)
 
-	var decoded *Command
-	err = gob.NewDecoder(buf).Decode(&decoded)
+	var wire wireCommand
+	err = gob.NewDecoder(buf).Decode(&wire)
+	assert.NoError(t, err)
+	decoded, err := wire.command()
 	assert.NoError(t, err)
 
 	assert.Equal(t, encoded, decoded)

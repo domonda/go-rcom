@@ -116,7 +116,7 @@ func Test_serveUntilSignal_pipelinedData(t *testing.T) {
 	// Send a request and one more byte after its body, which makes
 	// net/http stop watching the connection for being closed
 	body := bytes.NewBuffer(nil)
-	require.NoError(t, gob.NewEncoder(body).Encode(&Command{Name: "sleep", Args: []string{"30"}}))
+	require.NoError(t, gob.NewEncoder(body).Encode(newWireCommand(&Command{Name: "sleep", Args: []string{"30"}})))
 	conn, err := net.Dial("tcp", strings.TrimPrefix(addr, "http://"))
 	require.NoError(t, err)
 	defer conn.Close()
@@ -178,7 +178,7 @@ func Test_service_limits(t *testing.T) {
 	encodeRequest := func(t *testing.T, command *Command) *bytes.Buffer {
 		t.Helper()
 		body := bytes.NewBuffer(nil)
-		require.NoError(t, gob.NewEncoder(body).Encode(command))
+		require.NoError(t, gob.NewEncoder(body).Encode(newWireCommand(command)))
 		return body
 	}
 

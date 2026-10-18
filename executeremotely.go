@@ -47,7 +47,7 @@ func ExecuteRemotely(ctx context.Context, addr string, c *Command) (result *Resu
 	}
 
 	buf := bytes.NewBuffer(nil)
-	err = gob.NewEncoder(buf).Encode(c)
+	err = gob.NewEncoder(buf).Encode(newWireCommand(c))
 	if err != nil {
 		return nil, err
 	}
@@ -69,10 +69,10 @@ func ExecuteRemotely(ctx context.Context, addr string, c *Command) (result *Resu
 		return nil, fmt.Errorf("rcom.Command: response status %s: %s", response.Status, bytes.TrimSpace(message))
 	}
 
-	err = gob.NewDecoder(response.Body).Decode(&result)
+	var wire wireResult
+	err = gob.NewDecoder(response.Body).Decode(&wire)
 	if err != nil {
 		return nil, err
 	}
-
-	return result, nil
+	return wire.result()
 }

@@ -194,9 +194,9 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, s.maxRequestSize)
 	}
 
-	var command *Command
+	var wire wireCommand
 	body := bufio.NewReader(r.Body)
-	err := gob.NewDecoder(body).Decode(&command)
+	err := gob.NewDecoder(body).Decode(&wire)
 	if err == nil {
 		// The request body must end after the command because
 		// the server cancels the requests of closed connections
@@ -216,6 +216,11 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusRequestEntityTooLarge
 		}
 		http.Error(w, err.Error(), status)
+		return
+	}
+	command, err := wire.command()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -249,7 +254,7 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = gob.NewEncoder(w).Encode(result)
+	err = gob.NewEncoder(w).Encode(newWireResult(result))
 	if err != nil {
 		log.Error("can't encoding command response").
 			Err(err).
