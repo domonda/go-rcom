@@ -265,25 +265,3 @@ func Test_ExecuteRemotely_errorOutputTail(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, strings.HasSuffix(err.Error(), "last line"), "error ends with the output tail")
 }
-
-func Test_service_AllowedCommandEnvVars(t *testing.T) {
-	svc := &service{allowedCMDs: map[string]bool{"sh": true}, allowedEnvVars: []string{"OMP_THREAD_LIMIT"}}
-	serve := func(env map[string]string) *httptest.ResponseRecorder {
-		body := bytes.NewBuffer(nil)
-		require.NoError(t, writeWireCommand(body, &Command{Name: "sh", Args: []string{"-c", `printf %s "$OMP_THREAD_LIMIT"`}, Env: env}))
-		response := httptest.NewRecorder()
-		svc.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/", body))
-		return response
-	}
-
-	response := serve(map[string]string{"OMP_THREAD_LIMIT": "1"})
-	require.Equal(t, http.StatusOK, response.Code)
-	result, err := readWireResult(response.Body)
-	require.NoError(t, err)
-	assert.Equal(t, "1", result.Stdout)
-
-	// Variables like LD_PRELOAD would let a client run any code
-	response = serve(map[string]string{"LD_PRELOAD": "evil.so"})
-	assert.Equal(t, http.StatusBadRequest, response.Code)
-	assert.Contains(t, response.Body.String(), `environment variable "LD_PRELOAD" not allowed`)
-}

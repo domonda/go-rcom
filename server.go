@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -25,11 +26,14 @@ import (
 // Parameters:
 //   - port: The port number to listen on
 //   - gracefulShutdown: If true, enables graceful shutdown on SIGTERM/SIGINT/SIGHUP
-//   - allowedCMDs: Command names that are allowed to be executed
+//   - allowedCMDs: Command names that are allowed to be executed,
+//     names in the PATH or absolute paths
 //
 // GET /health responds with 200 OK for load balancer health checks.
-// The X-Request-ID header of a request is used for logging and returned
-// in the response, or a new request ID if the request has none.
+// Health check connections count against MaxConnections like all others.
+// A UUID in the X-Request-ID or X-Correlation-ID header of a request
+// is used for logging and returned in the response as X-Request-ID,
+// else a new request ID.
 //
 // The server receives gob-encoded Command structs via HTTP POST and returns
 // gob-encoded Result structs. Commands not in allowedCMDs, invalid commands
@@ -38,11 +42,13 @@ import (
 // Commands with Command.Env variables not in AllowedCommandEnvVars
 // are rejected with HTTP 400 Bad Request.
 //
-// The server applies MaxRequestSize, MaxConcurrentCommands,
-// MaxCommandDuration, MaxConnections and StallTimeout
-// as they are set when ListenAndServe is called.
-// Requests waiting for a command slot when the server shuts down
-// are rejected with HTTP 503 Service Unavailable.
+// The server applies MaxRequestSize, MaxRequestMemory, MaxConcurrentCommands,
+// MaxCommandDuration, MaxConnections, StallTimeout, MinTransferRate
+// and AllowedCommandEnvVars as they are set when ListenAndServe is called.
+// Requests waiting for memory longer than StallTimeout, requests waiting
+// for memory or a command slot when the server shuts down, and commands
+// canceled by the shutdown, are answered with HTTP 503 Service Unavailable,
+// which clients can retry.
 // A command is canceled when its client closes the connection.
 //
 // If gracefulShutdown is enabled, the server will on receiving a termination signal:
@@ -51,6 +57,12 @@ import (
 //   - Cancel requests still running after GracefulShutdownTimeout,
 //     or when a second signal is received, and return the shutdown error
 func ListenAndServe(port uint16, gracefulShutdown bool, allowedCMDs ...string) error {
+	for _, cmd := range allowedCMDs {
+		err := validateCommandName(cmd)
+		if err != nil {
+			return err
+		}
+	}
 	server := newServer(port, allowedCMDs)
 	listener, err := net.Listen("tcp", server.Addr)
 	if err != nil {
@@ -198,6 +210,9 @@ func (a *activeHandlers) wait(ctx context.Context) error {
 // healthPath is the URL path of the health check endpoint
 const healthPath = "/health"
 
+// requestIDHeader is the HTTP header of request IDs
+const requestIDHeader = "X-Request-ID"
+
 const (
 	// Timeouts of the server started by ListenAndServe.
 	// There is no timeout for reading the request body
@@ -222,6 +237,10 @@ type service struct {
 
 	// maxRequestSize limits the request size if greater than zero
 	maxRequestSize int64
+
+	// memory limits the memory of the requests read
+	// and not finished if not nil
+	memory *memoryBudget
 
 	// maxCommandDuration limits the command duration if greater than zero
 	maxCommandDuration time.Duration
@@ -250,11 +269,33 @@ func (s *service) shutdown() {
 	s.shutdownOnce.Do(func() { close(s.shuttingDown) })
 }
 
+// isShuttingDown returns if shutdown has been called
+func (s *service) isShuttingDown() bool {
+	select {
+	case <-s.shuttingDown:
+		return true
+	default:
+		return false
+	}
+}
+
+// dontReadBody makes net/http close the connection instead of
+// reading a request body the handler ignores, which a client
+// that never sends the body could otherwise block
+func dontReadBody(w http.ResponseWriter, r *http.Request) {
+	if r.ContentLength == 0 {
+		return
+	}
+	w.Header().Set("Connection", "close")
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+}
+
 func newService(allowedCMDs []string) *service {
 	s := &service{
 		allowedCMDs:        make(map[string]bool),
 		allowedEnvVars:     slices.Clone(AllowedCommandEnvVars),
 		maxRequestSize:     MaxRequestSize,
+		memory:             newMemoryBudget(MaxRequestMemory),
 		maxCommandDuration: MaxCommandDuration,
 		stallTimeout:       StallTimeout,
 		minTransferRate:    MinTransferRate,
@@ -282,10 +323,12 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if r.URL.Path == healthPath {
 		// For load balancers and container health checks
+		dontReadBody(w, r)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 	if r.Method != http.MethodPost {
+		dontReadBody(w, r)
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "rcom: commands are executed with POST requests", http.StatusMethodNotAllowed)
 		return
@@ -295,7 +338,16 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestID := golog.GetOrCreateRequestUUID(r)
 	ctx := golog.ContextWithRequestUUID(r.Context(), requestID)
 	resp := &response{w: w, transfer: s.transferLimits(), requestID: golog.FormatUUID(requestID)}
-	w.Header().Set("X-Request-ID", resp.requestID)
+	w.Header().Set(requestIDHeader, resp.requestID)
+
+	// Requests that don't fit into the memory budget wait unread
+	releaseMemory, status, err := s.reserveMemory(ctx, r)
+	if err != nil {
+		dontReadBody(w, r)
+		resp.error(status, err.Error())
+		return
+	}
+	defer releaseMemory()
 
 	command, status, err := s.readCommand(ctx, w, r)
 	if err != nil {
@@ -316,9 +368,16 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer release(s.inflight)
 
 	result, callID, err := s.execute(ctx, command)
+	// The input files are no longer needed,
+	// the inflight slot limits the memory of results
+	releaseMemory()
 	switch {
 	case errors.Is(err, errNoCommandSlot):
 		resp.error(http.StatusServiceUnavailable, err.Error())
+		return
+	case err != nil && ctx.Err() != nil && s.isShuttingDown():
+		// The shutdown canceled the command, another server can run it
+		resp.error(http.StatusServiceUnavailable, "rcom: server shut down while running the command: "+err.Error())
 		return
 	case errors.Is(err, os.ErrExist):
 		// Input file names that differ only in case
@@ -341,6 +400,34 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			UUID("callID", callID).
 			Log()
 	}
+}
+
+// reserveMemory reserves the size of the request body in the memory
+// budget, or MaxRequestSize if the size is unknown, and returns the function
+// releasing it, or an error and the HTTP status code to respond with.
+// It waits at most the stall timeout, because net/http doesn't notice
+// that the client closed the connection before the body is read.
+func (s *service) reserveMemory(ctx context.Context, r *http.Request) (release func(), status int, err error) {
+	if s.maxRequestSize > 0 && r.ContentLength > s.maxRequestSize {
+		return nil, http.StatusRequestEntityTooLarge, fmt.Errorf("request of %d bytes is larger than the maximum of %d bytes", r.ContentLength, s.maxRequestSize)
+	}
+	size := r.ContentLength
+	if size < 0 {
+		size = s.maxRequestSize
+		if size <= 0 {
+			size = math.MaxInt64 // The whole budget
+		}
+	}
+	if s.stallTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeoutCause(ctx, s.stallTimeout, fmt.Errorf("waited %s", s.stallTimeout))
+		defer cancel()
+	}
+	release, err = s.memory.reserve(ctx, s.shuttingDown, size)
+	if err != nil {
+		return nil, http.StatusServiceUnavailable, err
+	}
+	return release, http.StatusOK, nil
 }
 
 // readCommand reads the command of the request and returns it if it is

@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
+	"io"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/domonda/go-types/uu"
@@ -114,6 +116,26 @@ func Test_readWireCommand_limits(t *testing.T) {
 		})
 		assert.Less(t, allocated, uint64(32<<20), "allocated %d MiB", allocated>>20)
 	})
+}
+
+func Test_budgetReader(t *testing.T) {
+	budget := &budgetReader{r: bufio.NewReader(strings.NewReader("abcd")), n: 3}
+	b, err := budget.ReadByte()
+	require.NoError(t, err)
+	assert.Equal(t, byte('a'), b)
+	p := make([]byte, 10)
+	n, err := budget.Read(p)
+	require.NoError(t, err)
+	assert.Equal(t, "bc", string(p[:n]), "Read stops at the budget")
+	_, err = budget.ReadByte()
+	assert.ErrorIs(t, err, errWireMessageTooLarge)
+	_, err = budget.Read(p)
+	assert.ErrorIs(t, err, errWireMessageTooLarge)
+
+	budget = &budgetReader{r: bufio.NewReader(strings.NewReader("")), n: 3}
+	_, err = budget.ReadByte()
+	assert.ErrorIs(t, err, io.EOF, "the end of the stream is not over budget")
+	assert.Equal(t, int64(3), budget.n)
 }
 
 // measureAlloc returns the bytes allocated by f

@@ -102,7 +102,7 @@ func (resp *response) writeHijacked(status int, contentType string, writeBody fu
 		return err
 	}
 	if resp.requestID != "" {
-		_, err = fmt.Fprintf(w, "X-Request-ID: %s\r\n", resp.requestID)
+		_, err = fmt.Fprintf(w, "%s: %s\r\n", requestIDHeader, resp.requestID)
 		if err != nil {
 			return err
 		}

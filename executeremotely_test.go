@@ -1,14 +1,20 @@
 package rcom
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 
+	"github.com/domonda/golog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -58,4 +64,38 @@ func Test_ExecuteRemotely_errors(t *testing.T) {
 		}
 		assert.Equal(t, int32(1), newConns.Load(), "connections opened")
 	})
+}
+
+func Test_encodeCommand(t *testing.T) {
+	command, _ := cpCommand()
+	for range 2000 {
+		command.Args = append(command.Args, strings.Repeat("a", 50))
+	}
+	for i := range 8 {
+		command.Files[fmt.Sprintf("%d.bin", i)] = make([]byte, 256<<10)
+	}
+	command.Stdin = []byte("stdin")
+	body, err := encodeCommand(command)
+	require.NoError(t, err)
+	// Sized up front instead of grown, which copies
+	// the data and leaves up to twice its size allocated
+	assert.Less(t, cap(body), len(body)*11/10, "capacity %d for %d bytes", cap(body), len(body))
+
+	decoded, err := readWireCommand(bufio.NewReader(bytes.NewReader(body)))
+	require.NoError(t, err)
+	assert.Equal(t, command.Files, decoded.Files)
+}
+
+func Test_ExecuteRemotely_requestIDOfLoadBalancerError(t *testing.T) {
+	// A load balancer responds without the request ID
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no server available", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	command, _ := cpCommand()
+	_, err := ExecuteRemotely(golog.ContextWithRequestID(context.Background(), "job-42"), server.URL, command)
+	responseErr, ok := errors.AsType[*ResponseError](err)
+	require.True(t, ok, "error %v is a ResponseError", err)
+	assert.Equal(t, "job-42", responseErr.RequestID, "the sent request ID")
 }

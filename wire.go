@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -24,8 +25,10 @@ import (
 // maxWireHeaderSize, and every file is its own message.
 
 const (
-	// maxWireHeaderSize is the maximum size of a command header message
-	maxWireHeaderSize = 1 << 20
+	// maxWireHeaderSize is the maximum size of a command header message.
+	// Gob decodes an empty string of one byte into 16 bytes,
+	// so the decoded header takes at most about 5 MiB.
+	maxWireHeaderSize = 256 << 10
 
 	// maxWireFiles is the maximum number of files of a command or result
 	maxWireFiles = 10000
@@ -191,12 +194,7 @@ func readWireResult(r io.Reader) (*Result, error) {
 
 // writeWireFiles writes the files sorted by name
 func writeWireFiles(enc *gob.Encoder, files map[string][]byte) error {
-	names := make([]string, 0, len(files))
-	for name := range files {
-		names = append(names, name)
-	}
-	slices.SortFunc(names, strings.Compare)
-	for _, name := range names {
+	for _, name := range slices.Sorted(maps.Keys(files)) {
 		err := enc.Encode(&wireFile{Name: name, Data: files[name]})
 		if err != nil {
 			return err

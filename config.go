@@ -20,6 +20,17 @@ var (
 	// Zero or a negative value means no limit.
 	MaxRequestSize int64 = 1 << 30
 
+	// MaxRequestMemory is the maximum number of bytes that the requests
+	// to ListenAndServe hold in memory together, from reading the request
+	// until its command has finished. A request reserves its Content-Length,
+	// or MaxRequestSize if it has none, at most MaxRequestMemory,
+	// and waits unread until that much is free. Requests wait in the
+	// order they arrive, at most StallTimeout, and get HTTP 503
+	// after that or if the server shuts down.
+	// The memory of results is limited by MaxConcurrentCommands.
+	// Zero or a negative value means no limit.
+	MaxRequestMemory int64 = 2 << 30
+
 	// MaxConcurrentCommands is the maximum number of commands
 	// that ListenAndServe executes at the same time.
 	// Further requests wait until a running command has finished.
