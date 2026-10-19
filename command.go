@@ -3,8 +3,31 @@ package rcom
 import (
 	"errors"
 	"fmt"
+	"net/url"
+	"path"
+	"path/filepath"
 	"strings"
 )
+
+// fileNameSeparators are the path separators
+// that a Command file name must not contain
+const fileNameSeparators = `/\`
+
+// maxFileNameLength is the maximum file name length in bytes
+// of common file systems
+const maxFileNameLength = 255
+
+// maxErrorStringLength is the maximum length in bytes
+// of strings from requests that are put into error messages
+const maxErrorStringLength = 256
+
+// limitString returns s cut to maxLen bytes with "..." appended if it was longer
+func limitString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
 
 // Command represents a CLI command to be executed with associated input files and configuration.
 // Commands can be executed locally or remotely via the rcom server.
@@ -17,6 +40,12 @@ type Command struct {
 
 	// Stdin provides data to be written to the command's standard input.
 	Stdin []byte
+
+	// Env are environment variables (name to value) set for the command
+	// in addition to the InheritedEnvVars of the executing process.
+	// ListenAndServe only executes commands with variables
+	// listed in AllowedCommandEnvVars.
+	Env map[string]string
 
 	// Files are input files to be written to the command's working directory.
 	// Map keys are filenames (cannot contain path separators), values are file contents.
@@ -38,19 +67,26 @@ type Command struct {
 
 // Validate checks that the command is properly configured.
 // Returns an error if:
-// - Name is empty
-// - Any filename is empty or contains path separators
-// - Any result file pattern is empty or duplicated
+//   - Name is empty
+//   - Any filename is empty, "." or "..", longer than 255 bytes,
+//     or contains NUL or path separators, also in URL-encoded form like "%2F"
+//   - Any environment variable name is empty or contains "=" or NUL,
+//     or its value contains NUL
+//   - Any result file pattern is empty, duplicated or malformed
 func (c *Command) Validate() error {
-	if c.Name == "" {
-		return errors.New("rcom.Command: no command name provided")
+	err := validateCommandName(c.Name)
+	if err != nil {
+		return err
 	}
 	for fileName := range c.Files {
-		if fileName == "" {
-			return errors.New("rcom.Command: empty filename")
+		err := validateFileName(fileName)
+		if err != nil {
+			return err
 		}
-		if strings.ContainsAny(fileName, `/\`) {
-			return errors.New("rcom.Command: filename must not contain path separators")
+	}
+	for name, value := range c.Env {
+		if name == "" || strings.ContainsAny(name, "=\x00") || strings.ContainsRune(value, 0) {
+			return fmt.Errorf("rcom.Command: invalid environment variable %q", limitString(name, maxErrorStringLength))
 		}
 	}
 	patterns := make(map[string]bool)
@@ -59,9 +95,34 @@ func (c *Command) Validate() error {
 			return errors.New("rcom.Command: empty result file pattern")
 		}
 		if patterns[pattern] {
-			return fmt.Errorf("rcom.Command: duplicate result file pattern %q", pattern)
+			return fmt.Errorf("rcom.Command: duplicate result file pattern %q", limitString(pattern, maxErrorStringLength))
+		}
+		if _, err := path.Match(pattern, ""); err != nil {
+			return fmt.Errorf("rcom.Command: invalid result file pattern %q: %w", limitString(pattern, maxErrorStringLength), err)
 		}
 		patterns[pattern] = true
+	}
+	return nil
+}
+
+// validateFileName returns an error if fileName is not a plain file name
+// that stays in its directory. The URL-decoded form of the name is checked
+// too, because some file system libraries decode paths.
+func validateFileName(fileName string) error {
+	names := []string{fileName}
+	decoded, err := url.PathUnescape(fileName)
+	if err == nil && decoded != fileName {
+		names = append(names, decoded)
+	}
+	for _, name := range names {
+		switch {
+		case name == "":
+			return errors.New("rcom.Command: empty filename")
+		case name == "." || name == ".." || strings.ContainsRune(name, 0) || len(name) > maxFileNameLength:
+			return fmt.Errorf("rcom.Command: invalid filename %q", limitString(fileName, maxErrorStringLength))
+		case strings.ContainsAny(name, fileNameSeparators):
+			return fmt.Errorf("rcom.Command: filename %q must not contain path separators", limitString(fileName, maxErrorStringLength))
+		}
 	}
 	return nil
 }
@@ -73,4 +134,17 @@ func (c *Command) String() string {
 		return c.Name
 	}
 	return c.Name + " " + strings.Join(c.Args, " ")
+}
+
+// validateCommandName returns an error for an empty name or a relative
+// path, which would be resolved in the working directory of the command
+// that contains its input files
+func validateCommandName(name string) error {
+	if name == "" {
+		return errors.New("rcom.Command: no command name provided")
+	}
+	if filepath.Base(name) != name && !filepath.IsAbs(name) {
+		return fmt.Errorf("rcom.Command: command %q is neither a name in the PATH nor an absolute path", limitString(name, maxErrorStringLength))
+	}
+	return nil
 }

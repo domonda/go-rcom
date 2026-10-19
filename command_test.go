@@ -1,13 +1,16 @@
 package rcom
 
 import (
+	"bufio"
 	"bytes"
 	"context"
-	"encoding/gob"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/ungerik/go-fs"
 )
 
@@ -26,14 +29,12 @@ func cpCommand() (command *Command, expectedFile fs.MemFile) {
 func Test_GobCommand(t *testing.T) {
 	buf := bytes.NewBuffer(nil)
 
-	// gob.Register(&fs.MemFile{}) // Using []fs.FileReader for Command.File does not work
-
+	// Commands are sent as a gob stream
 	encoded, _ := cpCommand()
-	err := gob.NewEncoder(buf).Encode(encoded)
+	err := writeWireCommand(buf, encoded)
 	assert.NoError(t, err)
 
-	var decoded *Command
-	err = gob.NewDecoder(buf).Decode(&decoded)
+	decoded, err := readWireCommand(bufio.NewReader(buf))
 	assert.NoError(t, err)
 
 	assert.Equal(t, encoded, decoded)
@@ -54,7 +55,7 @@ func Test_Command_ExecuteLocally(t *testing.T) {
 }
 
 func Test_Command_ExecuteRemotely(t *testing.T) {
-	svc := &service{map[string]bool{copyCmd(): true}}
+	svc := &service{allowedCMDs: map[string]bool{copyCmd(): true}}
 	server := httptest.NewServer(svc)
 	defer server.Close()
 
@@ -66,4 +67,62 @@ func Test_Command_ExecuteRemotely(t *testing.T) {
 	resultFileData, ok := result.Files[expectedFile.Name()]
 	assert.True(t, ok, "expected result file exists")
 	assert.Equal(t, expectedFile.FileData, resultFileData, "result file has expected content")
+}
+
+func Test_Command_Validate(t *testing.T) {
+	valid := &Command{
+		Name:               copyCmd(),
+		Files:              map[string][]byte{"input.txt": nil, "100%.txt": nil, "a%20b.txt": nil},
+		ResultFilePatterns: []string{"*.txt", "output-?.json"},
+	}
+	assert.NoError(t, valid.Validate())
+
+	// Each file name must stay in the working directory,
+	// also after URL-decoding by file system libraries
+	invalidFileNames := []string{
+		"",
+		".",
+		"..",
+		"dir/input.txt",
+		`dir\input.txt`,
+		`C:\input.txt`,
+		"..%2Finput.txt",
+		"..%5Cinput.txt",
+		"dir%2finput.txt",
+		"%2E%2E",
+		"nul\x00.txt",
+		strings.Repeat("x", 256),
+	}
+	for _, name := range invalidFileNames {
+		command := &Command{Name: copyCmd(), Files: map[string][]byte{name: nil}}
+		assert.Error(t, command.Validate(), "file name %q", name)
+	}
+
+	invalidPatterns := map[string][]string{
+		"empty":     {""},
+		"duplicate": {"*.txt", "*.txt"},
+		"malformed": {"["},
+	}
+	for name, patterns := range invalidPatterns {
+		command := &Command{Name: copyCmd(), ResultFilePatterns: patterns}
+		assert.Error(t, command.Validate(), name)
+	}
+
+	for _, name := range []string{"", "A=B", "NUL\x00"} {
+		command := &Command{Name: copyCmd(), Env: map[string]string{name: "value"}}
+		assert.Error(t, command.Validate(), "environment variable %q", name)
+	}
+	assert.Error(t, (&Command{Name: copyCmd(), Env: map[string]string{"A": "NUL\x00"}}).Validate(), "NUL in value")
+	assert.NoError(t, (&Command{Name: copyCmd(), Env: map[string]string{"A": "a=b"}}).Validate())
+
+	assert.Error(t, (&Command{}).Validate(), "no command name")
+
+	// A relative path would be resolved in the working directory
+	// that contains the input files
+	for _, name := range []string{"./tool", "bin/tool", "tool/"} {
+		assert.ErrorContains(t, (&Command{Name: name}).Validate(), "nor an absolute path", name)
+	}
+	absolute, err := filepath.Abs("tool")
+	require.NoError(t, err)
+	assert.NoError(t, (&Command{Name: absolute}).Validate(), "absolute path")
 }

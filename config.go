@@ -1,6 +1,7 @@
 package rcom
 
 import (
+	"runtime"
 	"time"
 
 	"github.com/domonda/golog"
@@ -8,14 +9,103 @@ import (
 )
 
 var (
+	// GracefulShutdownTimeout is how long ListenAndServe waits
+	// for running requests after a termination signal.
+	// Zero or a negative value waits until a second signal.
 	GracefulShutdownTimeout = time.Minute
+
+	// MaxRequestSize is the maximum size in bytes of a request,
+	// including all input files, that ListenAndServe accepts.
+	// Larger requests are rejected with HTTP 413 Request Entity Too Large.
+	// Zero or a negative value means no limit.
+	MaxRequestSize int64 = 1 << 30
+
+	// MaxRequestMemory is the maximum number of bytes that the requests
+	// to ListenAndServe hold in memory together, from reading the request
+	// until its command has finished. A request reserves its Content-Length,
+	// or MaxRequestSize if it has none, at most MaxRequestMemory,
+	// and waits unread until that much is free. Requests wait in the
+	// order they arrive, at most StallTimeout, and get HTTP 503
+	// after that or if the server shuts down.
+	// The memory of results is limited by MaxConcurrentCommands.
+	// Zero or a negative value means no limit.
+	MaxRequestMemory int64 = 2 << 30
+
+	// MaxConcurrentCommands is the maximum number of commands
+	// that ListenAndServe executes at the same time.
+	// Further requests wait until a running command has finished.
+	// Zero or a negative value means no limit.
+	// The default is GOMAXPROCS, which follows container CPU limits.
+	MaxConcurrentCommands = runtime.GOMAXPROCS(0)
+
+	// MaxCommandDuration is the maximum time a command executed
+	// by ListenAndServe may run before it is killed.
+	// Zero or a negative value means no limit.
+	MaxCommandDuration = time.Hour
+
+	// MaxConnections is the maximum number of connections
+	// that ListenAndServe accepts at the same time.
+	// Further connections wait until an accepted one is closed.
+	// Zero or a negative value means no limit.
+	MaxConnections = 256
+
+	// StallTimeout is how long ListenAndServe waits for a client
+	// to send more of its request or to receive more of the response
+	// before closing the connection.
+	// Zero or a negative value means no timeout.
+	StallTimeout = time.Minute
+
+	// MinTransferRate is the minimum average rate in bytes per second
+	// at which ListenAndServe receives a request and sends a response,
+	// starting after StallTimeout, so that slow clients
+	// can't hold connections and memory for long.
+	// Zero or a negative value, or no StallTimeout, means no minimum.
+	MinTransferRate int64 = 16 << 10
+
+	// MaxOutputSize is the maximum number of bytes that a command
+	// executed by ExecuteLocally may write to stdout and stderr together.
+	// A command writing more is killed and an error is returned.
+	// Zero or a negative value means no limit.
+	MaxOutputSize int64 = 64 << 20
+
+	// MaxResultFilesSize is the maximum total size in bytes
+	// of the result files that ExecuteLocally reads.
+	// Zero or a negative value means no limit.
+	MaxResultFilesSize int64 = 1 << 30
+
+	// InheritedEnvVars are the environment variables that commands
+	// executed by ExecuteLocally inherit from the process,
+	// so that secrets in the environment of a server don't reach them.
+	// Names are case-insensitive on Windows.
+	// Nil means all variables are inherited.
+	// Proxy variables are not inherited by default
+	// because their URLs can contain credentials.
+	InheritedEnvVars = []string{
+		"PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TZ",
+		"TMPDIR", "TMP", "TEMP", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR",
+		// Windows
+		"SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "PATHEXT", "COMSPEC", "OS", "USERNAME", "USERPROFILE",
+		"HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "ALLUSERSPROFILE", "PUBLIC",
+		"PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+		"COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)", "COMMONPROGRAMW6432",
+		"PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
+	}
+
+	// AllowedCommandEnvVars are the names of the Command.Env variables
+	// that clients may set for commands executed by ListenAndServe.
+	// Names are case-insensitive on Windows.
+	// Allowing variables like LD_PRELOAD would let clients run any code.
+	AllowedCommandEnvVars = []string{
+		"OMP_THREAD_LIMIT", "OMP_NUM_THREADS", "MAGICK_THREAD_LIMIT", "TZ", "LANG", "LC_ALL",
+	}
 
 	log = rootlog.NewPackageLogger()
 )
 
 // SetLogger changes the logger used by the package.
 // Passing nil disables logging.
-// The default is github.com/domonda/golog/log.NewPackageLogger("rcom")
+// The default is github.com/domonda/golog/log.NewPackageLogger(),
+// which prefixes messages with "go-rcom: ".
 func SetLogger(l *golog.Logger) {
 	log = l
 }

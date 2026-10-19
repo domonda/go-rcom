@@ -13,12 +13,23 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 )
 
+// ErrOutputTooLarge is returned by Cmd.Run if the command wrote
+// more output than the limit set with Cmd.WithMaxOutputSize
+var ErrOutputTooLarge = errors.New("command output too large")
+
+// killWaitTimeout is how long Run waits, in addition to the WaitDelay,
+// for a process killed because of the canceled context to end
+const killWaitTimeout = 5 * time.Second
+
 type Cmd struct {
-	cmd         *exec.Cmd
-	killSubProc bool
+	cmd           *exec.Cmd
+	killSubProc   bool
+	maxOutputSize int64
 }
 
 // Command returns the Cmd struct to execute the named program with
@@ -83,8 +94,27 @@ func (c *Cmd) WithStdin(stdin io.Reader) *Cmd {
 	return c
 }
 
+// WithKillSubProcesses kills the subprocesses of the command
+// when the context of Run is canceled and when the command has exited.
+// Not supported on Windows, where only the command process is killed.
 func (c *Cmd) WithKillSubProcesses() *Cmd {
 	c.killSubProc = true
+	return c
+}
+
+// WithWaitDelay bounds how long Run waits for the output pipes
+// to be closed after the process exited, which a subprocess
+// that inherited them can delay. See os/exec.Cmd.WaitDelay.
+func (c *Cmd) WithWaitDelay(delay time.Duration) *Cmd {
+	c.cmd.WaitDelay = delay
+	return c
+}
+
+// WithMaxOutputSize makes Run kill the command and return ErrOutputTooLarge
+// if it writes more than maxSize bytes to stdout and stderr together.
+// Zero or a negative maxSize means no limit.
+func (c *Cmd) WithMaxOutputSize(maxSize int64) *Cmd {
+	c.maxOutputSize = maxSize
 	return c
 }
 
@@ -110,50 +140,57 @@ func (c *Cmd) Run(ctx context.Context) (*Result, error) {
 		stderr   strings.Builder
 		combined strings.Builder
 	)
-	c.cmd.Stdout = io.MultiWriter(&stdout, &combined)
-	c.cmd.Stderr = io.MultiWriter(&stderr, &combined)
+	// os/exec copies stdout and stderr in separate goroutines,
+	// so their writes to combined have to be serialized.
+	// combinedWriter comes first to limit stdout and stderr too.
+	combinedWriter := &lockedWriter{w: &combined, maxSize: c.maxOutputSize, onExceeded: func() { _ = c.kill() }}
+	c.cmd.Stdout = io.MultiWriter(combinedWriter, &stdout)
+	c.cmd.Stderr = io.MultiWriter(combinedWriter, &stderr)
 
 	err := c.cmd.Start()
 	if err != nil {
 		return nil, err
 	}
 
-	done := make(chan error, 2)
-	dontKill := make(chan struct{}, 1)
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			done <- c.kill()
-		case <-dontKill:
-			return
-		}
-	}()
-
+	waited := make(chan error, 1)
 	go func() {
 		err := c.cmd.Wait()
+		c.killSubProcesses()
 		var exitError *exec.ExitError
-		if errors.As(err, &exitError) {
+		if errors.As(err, &exitError) || errors.Is(err, exec.ErrWaitDelay) {
 			// We are not interested in exit errors
 			// because they are just a wrapper for
 			// non zero exit status codes
-			// which we also get from c.cmd.ProcessState.
+			// which we also get from c.cmd.ProcessState,
+			// and the process has exited if a subprocess
+			// held the output pipes open after the WaitDelay.
 			err = nil
 		}
-		dontKill <- struct{}{}
-		done <- err
+		if combinedWriter.exceeded() {
+			err = fmt.Errorf("%w: more than %d bytes", ErrOutputTooLarge, c.maxOutputSize)
+		}
+		waited <- err
 	}()
 
 	// Wait for either finished command run or canceled context
-	err = <-done
-
-	switch {
-	case ctx.Err() != nil && err != nil:
-		return nil, fmt.Errorf("%s error killing process because of: %w", err, ctx.Err())
-	case ctx.Err() != nil:
+	select {
+	case err = <-waited:
+		if err != nil {
+			return nil, err
+		}
+	case <-ctx.Done():
+		killErr := c.kill()
+		// Wait until the killed process has been reaped so that it
+		// does not run on after Run returned, bounded because
+		// subprocesses that were not killed can keep the output open
+		select {
+		case <-waited:
+		case <-time.After(c.cmd.WaitDelay + killWaitTimeout):
+		}
+		if killErr != nil {
+			return nil, fmt.Errorf("%s error killing process because of: %w", killErr, ctx.Err())
+		}
 		return nil, fmt.Errorf("killed process because of: %w", ctx.Err())
-	case err != nil:
-		return nil, err
 	}
 
 	result := &Result{
@@ -165,6 +202,38 @@ func (c *Cmd) Run(ctx context.Context) (*Result, error) {
 	}
 
 	return result, nil
+}
+
+// lockedWriter serializes writes to w and, if maxSize is greater than zero,
+// returns ErrOutputTooLarge after maxSize bytes and calls onExceeded once
+type lockedWriter struct {
+	mu         sync.Mutex
+	w          io.Writer
+	written    int64
+	maxSize    int64
+	onExceeded func()
+	isExceeded bool
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.maxSize > 0 && l.written+int64(len(p)) > l.maxSize {
+		if !l.isExceeded {
+			l.isExceeded = true
+			l.onExceeded()
+		}
+		return 0, ErrOutputTooLarge
+	}
+	n, err := l.w.Write(p)
+	l.written += int64(n)
+	return n, err
+}
+
+func (l *lockedWriter) exceeded() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.isExceeded
 }
 
 type Result struct {
