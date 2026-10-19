@@ -24,16 +24,17 @@ Create a client and execute commands:
 
 	result, err := client.Execute(ctx, []string{"-version"}, nil)
 
-Or build a command, where fs.FileReader arguments are sent as input files:
+Or build a command, where fs.FileReader arguments are sent as input files
+and passed as "./" plus their base name:
 
 	result, err := client.Cmd("convert").
 		WithArgs(inputFile, "-resize", "50%", "output.png").
 		WithResultFilePatterns("output.png").
 		Run(ctx)
 
-GET /health on the server responds with 200 OK for health checks,
-and the X-Request-ID header is passed on from the golog requestID
-of the client's context to the server's logs.
+GET /health on the server responds with 200 OK for health checks.
+The golog request ID of the client's context, or a new one,
+is sent as X-Request-ID header and used in the server's logs if it is a UUID.
 
 # Command Execution
 
@@ -42,6 +43,7 @@ Commands are represented by the Command struct which includes:
   - Args: Command arguments
   - Files: Input files (name -> content)
   - Stdin: Standard input data
+  - Env: Environment variables, the server only accepts the AllowedCommandEnvVars
   - ResultFilePatterns: Glob patterns for result files
   - NonErrorExitCodes: Exit codes to not treat as errors
 
@@ -84,11 +86,12 @@ The server implements several security measures:
     and clients can only set the AllowedCommandEnvVars
   - Subprocess cleanup: Child processes are killed on context cancellation
     and after the command exited (not on Windows)
-  - Limits: MaxRequestSize, MaxConnections, StallTimeout, MinTransferRate,
-    MaxConcurrentCommands, MaxCommandDuration, MaxOutputSize and MaxResultFilesSize.
+  - Limits: MaxRequestSize, MaxRequestMemory, MaxConnections, StallTimeout,
+    MinTransferRate, MaxConcurrentCommands, MaxCommandDuration, MaxOutputSize
+    and MaxResultFilesSize.
     Requests are gob-decoded before the command name is checked, the command
-    header is limited to 1 MiB and every file is its own message, but gob can
-    allocate up to about 10 MiB per message before its data arrives.
+    header is limited to 256 KiB and every file is its own message, but gob can
+    allocate up to about 14 MiB per connection before the data arrives.
   - Disconnects: A command is canceled when its client closes the connection
 
 The server has no authentication, run it in a private network.
@@ -135,9 +138,10 @@ The server supports graceful shutdown when configured:
 	err := rcom.ListenAndServe(8080, true, "convert")
 
 On receiving SIGTERM, SIGINT, or SIGHUP, the server will:
- 1. Stop accepting new requests, reject requests waiting for a command slot with 503
+ 1. Stop accepting new requests, reject requests waiting for memory or a command slot with 503
  2. Wait for in-flight requests to complete, then ListenAndServe returns http.ErrServerClosed
- 3. Cancel requests still running after GracefulShutdownTimeout or a second signal
+ 3. Cancel requests still running after GracefulShutdownTimeout or a second signal,
+    which get 503
 
 A zero or negative GracefulShutdownTimeout waits for the running requests
 until a second signal.

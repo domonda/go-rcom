@@ -14,8 +14,8 @@ Go package for executing remote CLI commands with input/output file support over
 - **Command Whitelisting**: Server restricts execution to explicitly allowed commands
 - **Timeout Support**: Configurable timeouts for command execution
 - **Separate Working Directories**: Each command runs in its own temporary directory
-- **Server Limits**: Request size, connections, stalled transfers, concurrent commands,
-  command duration, output and result file sizes
+- **Server Limits**: Request size and memory, connections, stalled transfers,
+  concurrent commands, command duration, output and result file sizes
 - **Context Support**: Full context.Context support for cancellation
 
 ## Installation
@@ -191,14 +191,20 @@ client := rcom.NewClient(
 )
 ```
 
-`ClientWithRetries` retries requests that failed before reaching the server
-or got 502, 503 or 504 as load balancers respond while a server is not available,
-with delays of 1, 1, 2, 3, 5 seconds and so on. Failed commands are not retried.
-A request can fail after reaching the server, so retried commands should be idempotent.
-An error response of the server is returned as `*rcom.ResponseError` with its status code.
+`ClientWithRetries` retries requests that got no response, or 502 or 503
+as load balancers respond while no server is available and the server responds
+while it shuts down. The delays are 1, 1, 2, 3, 5 seconds and so on, each shortened
+by a random amount of up to half. Failed commands, 504 Gateway Timeout (the server
+can still be executing the command) and invalid results are not retried.
+A connection can break while the server executes the command,
+so retried commands should be idempotent. A command that makes a server crash
+is retried on the next server, because the load balancer responds with 502.
+An error response of the server is returned as `*rcom.ResponseError`
+with its status code, message and request ID.
 
-The client sends the golog `requestID` of the context as `X-Request-ID` header,
-which the server uses in its logs:
+The client sends the golog request ID of the context as `X-Request-ID` header,
+or a new UUID that all retries of a command share, and the server uses it
+in its logs if it is a UUID:
 
 ```go
 ctx = golog.ContextWithRequestUUID(ctx, requestID)
@@ -208,7 +214,10 @@ ctx = golog.ContextWithRequestUUID(ctx, requestID)
 
 `Client.Cmd` builds a command with its `With` methods and executes it with `Run`.
 `WithArgs` takes strings and `fs.FileReader` like `fs.File` or `fs.MemFile`,
-which are sent as input files and used by their base name as arguments:
+which are sent as input files and passed as `./` plus their base name,
+also when the name is a Windows path like the file name of a browser upload.
+The `./` prefix keeps the uploader of a file from making its name an option
+or special syntax of the command, like `-o`, `@options` or `|cmd`:
 
 ```go
 result, err := client.Cmd("tesseract").
@@ -223,7 +232,9 @@ hocr, err := result.MemFile("output.hocr")
 ```
 
 Further methods are `WithStringArgs`, `WithFiles`, `WithStdin`
-and `WithNonErrorExitCodes`.
+and `WithNonErrorExitCodes`. `WithFiles` and `Client.Execute` send files
+under their base name too, so string arguments naming them must use the base
+name, which differs from `file.Name()` for a Windows path.
 
 ### Multiple Commands
 
@@ -312,8 +323,9 @@ environment variable, or 3666 if it is not set.
 ### Health Checks and Request IDs
 
 `GET /health` responds with 200 OK for load balancer and container health checks.
-The server logs with the `X-Request-ID` header of a request, or a new request ID,
-and returns it in the response.
+Health check connections count against `MaxConnections` like all others.
+The server logs with the UUID in the `X-Request-ID` or `X-Correlation-ID` header
+of a request, or a new request ID, and returns it as `X-Request-ID` in the response.
 
 ### Custom Port
 
@@ -333,7 +345,10 @@ With graceful shutdown, `ListenAndServe` returns `http.ErrServerClosed`
 after the running requests have finished. Requests still running after
 `GracefulShutdownTimeout`, or when a second signal arrives, are canceled
 and `ListenAndServe` returns the shutdown error. A zero or negative
-`GracefulShutdownTimeout` waits for the running requests until a second signal:
+`GracefulShutdownTimeout` waits for the running requests until a second signal.
+Canceled commands get 503, which clients retry, if the timeout is shorter than
+the time the container gets to stop (for example the ECS `stopTimeout`,
+30 seconds by default); otherwise their connections break:
 
 ```go
 rcom.GracefulShutdownTimeout = 2 * time.Minute
@@ -342,20 +357,28 @@ err := rcom.ListenAndServe(8080, true, "convert")
 
 ### Server Limits
 
-`ListenAndServe` applies these package variables as they are set when it is called.
-Zero or a negative value means no limit:
+`ListenAndServe` applies these package variables, and `AllowedCommandEnvVars`,
+as they are set when it is called. Zero or a negative value means no limit:
 
 | Variable | Default | Effect |
 |---|---|---|
 | `MaxRequestSize` | 1 GiB | Larger requests are rejected with 413 |
+| `MaxRequestMemory` | 2 GiB | Requests that would hold more memory together wait unread in the order they arrive, and get 503 after `StallTimeout` or if the server shuts down |
 | `MaxConnections` | 256 | Further connections wait to be accepted |
 | `StallTimeout` | 1 minute | Ends a request whose client sends or receives nothing for that time |
 | `MinTransferRate` | 16 KiB/s | Ends a request whose client sends or receives slower, after `StallTimeout` |
 | `MaxConcurrentCommands` | `GOMAXPROCS` | Further requests wait, and get 503 if the server shuts down |
 | `MaxCommandDuration` | 1 hour | Longer running commands are killed |
 
-At most twice `MaxConcurrentCommands` requests can hold command results in memory
-while they are sent, and commands can have at most 10000 input or result files.
+A request reserves its Content-Length (or `MaxRequestSize` if it has none,
+at most `MaxRequestMemory`) from `MaxRequestMemory` before it is read,
+until its command has finished. Gob reads a large input file in growing 10 MiB
+chunks and copies it, so decoding allocates up to about 5 times the file's size
+before the garbage collector frees most of it. Set `GOMEMLIMIT` below the memory
+of the container, so that the garbage is collected in time, and leave room for
+the largest file. At most twice
+`MaxConcurrentCommands` requests can hold command results in memory while they
+are sent, and commands can have at most 10000 input or result files.
 
 `ExecuteLocally`, which the server uses, also applies:
 
@@ -442,10 +465,13 @@ Each command execution gets a unique temporary directory:
 6. **No Authentication**: The server accepts requests from anyone who can reach
    its port over plain HTTP. Run it in a private network or behind an authenticating proxy
 7. **Untrusted Requests**: Requests are gob-decoded before the command name is checked.
-   The command header is limited to 1 MiB and every file is its own message,
-   but gob can allocate up to about 10 MiB per message before its data arrives,
-   so slow clients can hold up to `MaxConnections` times 10 MiB of memory,
-   for at most `StallTimeout` plus the time `MinTransferRate` allows
+   The command header is limited to 256 KiB, which gob decodes into at most
+   about 5 MiB, and every file is its own message. While the header is kept,
+   gob can allocate up to about 10 MiB more for the next message before its
+   data arrives, so slow clients can hold up to `MaxConnections` times about
+   14 MiB of memory (3.5 GiB with the defaults),
+   for at most `StallTimeout` plus the time `MinTransferRate` allows.
+   The input files of requests are limited by `MaxRequestMemory`
 8. **Environment**: Commands only inherit the `InheritedEnvVars`,
    and clients can only set the `AllowedCommandEnvVars`
 
@@ -454,13 +480,16 @@ Each command execution gets a unique temporary directory:
 All errors are returned with context. Common error scenarios:
 
 - **Command not allowed**: Server rejects command not in whitelist
+- **Invalid allowed commands**: `ListenAndServe` returns an error for an allowed
+  command that is neither a name in the `PATH` nor an absolute path, like `./convert`
 - **Invalid filenames**: Filenames with path separators are rejected
 - **Duplicate filenames**: `Client` rejects input files with the same base name.
   File names that differ only in case are rejected on case-insensitive file systems,
   like on macOS and Windows, by the server with 400
 - **Request too large**: Requests larger than `MaxRequestSize` are rejected with 413
 - **Invalid request**: Invalid commands and data after the command are rejected with 400
-- **Shutting down**: Requests waiting for a command slot are rejected with 503
+- **Shutting down**: Requests waiting for memory or a command slot, and commands
+  canceled by the shutdown, get 503, which `ClientWithRetries` retries
 - **Command limits**: Commands running longer than `MaxCommandDuration` or writing
   more than `MaxOutputSize` are killed, and the server responds with 500
 - **Non-zero exit codes**: Treated as errors unless in `NonErrorExitCodes`
@@ -557,7 +586,7 @@ endpoint and `X-Request-ID` handling are the same. The differences:
   deployment requests between old and new versions fail.
 - **Retries**: the domonda-service client retried every request 5 times,
   also failed commands with status 500. Use `ClientWithRetries(5)`,
-  which only retries unreachable servers and 502, 503 and 504.
+  which only retries requests without a response and 502 and 503.
   `GetRetryCountFunc` has no equivalent; configure the client instead.
 - **Results**: `Result.CombinedOutput` is `Result.Output`,
   and `Result.WriteFile(ctx, file)` is `Result.WriteTo(file)`.
@@ -567,9 +596,12 @@ endpoint and `X-Request-ID` handling are the same. The differences:
   server, only the `InheritedEnvVars`, and clients can only set the
   `AllowedCommandEnvVars`. Add the variables your commands need.
 - **Limits**: the server limits above are new. Behind a load balancer, check that
-  `MaxCommandDuration` and the time requests wait for one of the
-  `MaxConcurrentCommands` fit its idle timeout, and that `MaxRequestSize`,
-  `MaxOutputSize` and `MaxResultFilesSize` fit your largest documents.
+  `MaxCommandDuration` and the time requests wait for memory or one of the
+  `MaxConcurrentCommands` fit its idle timeout, that `MaxRequestSize`,
+  `MaxOutputSize` and `MaxResultFilesSize` fit your largest documents,
+  and that `MaxRequestMemory`, the results and the decoding of the largest file
+  fit the memory of the container (with `GOMEMLIMIT` set).
+- **File arguments**: `WithArgs` passes a file as `./name` instead of `name`.
 - **Cancellation**: a command is killed when its client disconnects,
   for example when a load balancer times out, instead of running to its end.
 

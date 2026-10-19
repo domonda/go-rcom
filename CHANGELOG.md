@@ -9,7 +9,7 @@ Releases are git-tagged with the version from the `VERSION` file.
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-10-18
+## [0.1.0] - 2026-10-19
 
 First tagged release. It requires Go 1.26 and depends on tagged releases:
 go-types v1.0.0-beta.2, golog v1.3.0 and go-fs v0.1.0. The Changed, Fixed and
@@ -28,26 +28,33 @@ Security sections compare with the earlier untagged builds.
   between local and remote execution.
 - `Client` and `NewClient` with the options `ClientWithHost`,
   `ClientWithPort`, `ClientWithCmds`, `ClientWithTimeout` and
-  `ClientWithRetries`, which retries requests that did not reach the server
-  or got 502, 503 or 504, but not failed commands. `ClientWithTimeOut` is a
-  deprecated alias of `ClientWithTimeout`.
+  `ClientWithRetries`, which retries requests that got no response or got
+  502 or 503, with Fibonacci delays and jitter, but not failed commands,
+  504 or invalid results. `ClientWithTimeOut` is a deprecated alias of
+  `ClientWithTimeout`.
 - `Client.Cmd` builds a command with `WithArgs`, `WithStringArgs`,
   `WithFiles`, `WithStdin`, `WithEnv`, `WithResultFilePatterns` and
   `WithNonErrorExitCodes` and executes it with `Run`, the API of the
   domonda-service rcom package. `WithArgs` sends `fs.FileReader` arguments
-  as input files.
+  as input files and passes them as `./` plus their base name, so that an
+  uploaded file's name can't be an option or special syntax of the command.
 - `Command.Env` sets environment variables for a command; the server only
   accepts the `AllowedCommandEnvVars`.
 - `Result.FileData` and `Result.MemFile` return a result file, and
-  `ExecuteRemotely` returns server errors as `*ResponseError`.
+  `ExecuteRemotely` returns server errors as `*ResponseError` with the
+  status, message and request ID.
 - `GET /health` responds with 200 OK, and the `X-Request-ID` header is passed
   on from the golog `requestID` of the client's context to the server's logs
-  and response.
+  and response. `Client` creates a request ID that all retries of a command
+  share if the context has none.
 - `ListenAndServe` serves the whitelisted command names (their arguments are
   not restricted) with optional graceful shutdown on SIGTERM, SIGINT and
   SIGHUP. `SetLogger` replaces the package logger.
 - Server limits: `MaxRequestSize` (default 1 GiB, larger requests get HTTP
-  413), `MaxConnections` (256, further connections wait), `StallTimeout`
+  413), `MaxRequestMemory` (2 GiB for the requests being read or executed
+  together, further requests wait unread in the order they arrive and get
+  503 after `StallTimeout` or when the server shuts down),
+  `MaxConnections` (256, further connections wait), `StallTimeout`
   (1 minute without the client sending or receiving ends the request),
   `MinTransferRate` (16 KiB/s after `StallTimeout`), `MaxConcurrentCommands`
   (`GOMAXPROCS`, further requests wait) and `MaxCommandDuration` (1 hour).
@@ -69,7 +76,7 @@ Security sections compare with the earlier untagged builds.
 ### Changed
 
 - **Breaking:** commands and results are sent as a stream of gob messages, a
-  header of at most 1 MiB and one message per file, so clients and servers of
+  header of at most 256 KiB and one message per file, so clients and servers of
   this release can't talk to earlier untagged builds or to the domonda-service
   rcom package. Successful responses use chunked encoding.
 - **Breaking:** commands only inherit the `InheritedEnvVars` (`PATH`,
@@ -90,13 +97,15 @@ Security sections compare with the earlier untagged builds.
   and the shutdown error is returned after their cleanup.
 - `Command.Validate` also rejects file names that are `.` or `..`, contain
   NUL, are longer than 255 bytes or contain a URL-encoded path separator,
-  and malformed result file patterns.
+  malformed result file patterns, and command names that are relative paths
+  like `./convert`, which would be resolved in the working directory with the
+  input files. `ListenAndServe` returns an error for such allowed commands.
 - The client sends each input file under its base name, also when the name
   is a Windows path like the file name of a browser upload, and returns an
   error for two input files with the same base name.
 - The server answers invalid commands and requests with data after the
-  command with 400, and requests waiting for a command slot during shutdown
-  with 503.
+  command with 400, and requests waiting for memory or a command slot during
+  shutdown, and commands canceled by the shutdown, with 503.
 - Result files are regular files only, checked on the opened file; symlinks,
   directories, FIFOs and hard links to files outside of the working directory
   are skipped.
