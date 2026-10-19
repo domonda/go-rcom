@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/domonda/golog"
 	"github.com/ungerik/go-fs"
 )
 
@@ -25,6 +27,8 @@ type Client struct {
 // ExecuteWithCommand executes the allowed cmd on the server with the given
 // arguments and input files and returns the result. Each input file is sent
 // under its base name; two input files with the same base name are an error.
+// Arguments naming input files must use their base name, which differs
+// from the file's Name for a path like the Windows path of a browser upload.
 func (c *Client) ExecuteWithCommand(ctx context.Context, cmd string, cmdArgs []string, files []fs.FileReader, resultFilePatterns ...string) (*Result, error) {
 	inputFiles, err := readInputFiles(ctx, files)
 	if err != nil {
@@ -48,15 +52,25 @@ func (c *Client) run(ctx context.Context, command *Command) (*Result, error) {
 		return nil, err
 	}
 
+	body, err := encodeCommand(command)
+	if err != nil {
+		return nil, err
+	}
+
 	if c.timeout > 0 {
 		timeoutCtx, cancel := context.WithTimeoutCause(ctx, c.timeout, fmt.Errorf("rcom command %q timed out after %s: %w", command.Name, c.timeout, context.DeadlineExceeded))
 		defer cancel()
 		ctx = timeoutCtx
 	}
+	// All attempts share one request ID in the logs of the server
+	if golog.GetRequestIDFromContext(ctx) == "" {
+		ctx = golog.ContextWithRequestUUID(ctx, golog.UUIDv4())
+	}
 
 	for attempt := 1; ; attempt++ {
-		result, err := ExecuteRemotely(ctx, c.addr(), command)
+		result, err := postCommand(ctx, c.addr(), body)
 		if err == nil || attempt > c.retries || !isRetryable(ctx, err) {
+			// net/http errors contain the cause of an ended ctx
 			return result, err
 		}
 		log.DebugCtx(ctx, "Retrying rcom command").
@@ -64,10 +78,12 @@ func (c *Client) run(ctx context.Context, command *Command) (*Result, error) {
 			Str("command", command.Name).
 			Int("attempt", attempt).
 			Log()
+		timer := time.NewTimer(retryDelay(attempt))
 		select {
-		case <-time.After(retryBaseDelay * time.Duration(fibonacci(attempt))):
+		case <-timer.C:
 		case <-ctx.Done():
-			return nil, err
+			timer.Stop()
+			return nil, fmt.Errorf("%w (last attempt: %w)", context.Cause(ctx), err)
 		}
 	}
 }
@@ -75,21 +91,32 @@ func (c *Client) run(ctx context.Context, command *Command) (*Result, error) {
 // retryBaseDelay is the delay before the first retry
 var retryBaseDelay = time.Second
 
+// retryDelay returns the delay after the attempt, a random duration
+// between half and all of the attempt's Fibonacci number times
+// retryBaseDelay, so that clients don't retry at the same time
+func retryDelay(attempt int) time.Duration {
+	delay := retryBaseDelay * time.Duration(fibonacci(attempt))
+	return delay/2 + rand.N(delay/2+1)
+}
+
 // isRetryable returns if a request that failed with err should be retried:
-// if it failed before reaching the server, or with a status
-// that load balancers respond when the server is not available
+// if it got no response, or a status that load balancers respond
+// when no server is available. A 504 Gateway Timeout is not retried,
+// because the server can still be executing the command.
 func isRetryable(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
 		return false
 	}
+	if _, ok := errors.AsType[*transportError](err); ok {
+		return true
+	}
 	if responseErr, ok := errors.AsType[*ResponseError](err); ok {
 		switch responseErr.StatusCode {
-		case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		case http.StatusBadGateway, http.StatusServiceUnavailable:
 			return true
 		}
-		return false
 	}
-	return true
+	return false
 }
 
 // fibonacci returns the n-th Fibonacci number, starting with 1, 1, 2
@@ -191,13 +218,17 @@ func ClientWithTimeOut(timeout time.Duration) ClientOption {
 }
 
 // ClientWithRetries retries a command up to retries times
-// if the request failed before reaching the server, or the
-// server responded with 502, 503 or 504 as load balancers do
-// while a server is not available. A failed command is not retried.
-// The delays between the attempts follow the Fibonacci
-// sequence in seconds: 1, 1, 2, 3, 5 and so on.
-// Retried commands can run more than once if a request failed
-// after reaching the server, so they should be idempotent.
+// if the request got no response, or a 502 or 503 response
+// as load balancers and shutting down servers respond.
+// A failed command, a 504 Gateway Timeout and an invalid
+// result are not retried. The delays between the attempts
+// follow the Fibonacci sequence in seconds: 1, 1, 2, 3, 5
+// and so on, each shortened by a random amount of up to half.
+// Retried commands can run more than once if a connection
+// broke while the server was executing the command,
+// so they should be idempotent. A command that makes a server
+// crash is retried on the next server, because a load balancer
+// responds with 502 for it.
 func ClientWithRetries(retries int) ClientOption {
 	return func(c *Client) { c.retries = retries }
 }

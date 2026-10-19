@@ -3,7 +3,7 @@ package rcom
 import (
 	"context"
 	"fmt"
-	"maps"
+	"slices"
 
 	"github.com/ungerik/go-fs"
 )
@@ -30,7 +30,8 @@ type ClientCommand struct {
 
 // WithArgs appends arguments, which can be strings or fs.FileReader
 // like fs.File or fs.MemFile. A FileReader is sent as input file
-// and its base name is used as the argument.
+// and its base name prefixed with "./" is used as the argument,
+// so that its name is not an option of the command.
 func (cc *ClientCommand) WithArgs(args ...any) *ClientCommand {
 	cc.args = append(cc.args, args...)
 	return cc
@@ -45,6 +46,9 @@ func (cc *ClientCommand) WithStringArgs(args ...string) *ClientCommand {
 }
 
 // WithFiles adds input files that are sent under their base name.
+// Arguments naming them must use the base name too, which differs
+// from the file's Name for a path like the Windows path of a browser
+// upload, or pass the file to WithArgs, which does that.
 func (cc *ClientCommand) WithFiles(files ...fs.FileReader) *ClientCommand {
 	cc.files = append(cc.files, files...)
 	return cc
@@ -88,14 +92,14 @@ func (cc *ClientCommand) WithNonErrorExitCodes(exitCodes ...int) *ClientCommand 
 // with the timeout and retries of the client.
 func (cc *ClientCommand) Run(ctx context.Context) (*Result, error) {
 	command := cc.command
-	command.Args = nil
-	files := cc.files
+	// Clipped so that appending does not write to cc.files
+	files := slices.Clip(cc.files)
 	for i, arg := range cc.args {
 		switch arg := arg.(type) {
 		case string:
 			command.Args = append(command.Args, arg)
 		case fs.FileReader:
-			command.Args = append(command.Args, baseName(arg.Name()))
+			command.Args = append(command.Args, fileArg(arg.Name()))
 			files = append(files, arg)
 		default:
 			return nil, fmt.Errorf("rcom.ClientCommand: argument %d has unsupported type %T, use string or fs.FileReader", i, arg)
@@ -106,8 +110,13 @@ func (cc *ClientCommand) Run(ctx context.Context) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Run can be called again after changing the ClientCommand
-	command.Env = maps.Clone(command.Env)
-	command.NonErrorExitCodes = maps.Clone(command.NonErrorExitCodes)
 	return cc.client.run(ctx, &command)
+}
+
+// fileArg returns the argument for an input file named name:
+// its base name prefixed with "./", so that a name chosen by the
+// uploader of a file like "-o", "@options" or "|cmd" is not
+// an option or special syntax of the command
+func fileArg(name string) string {
+	return "./" + baseName(name)
 }

@@ -3,6 +3,7 @@ package rcom
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/domonda/golog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/ungerik/go-fs"
@@ -110,6 +112,7 @@ func Test_Client_Execute_timeout(t *testing.T) {
 	client := newTestClient(t, "sleep", ClientWithTimeout(50*time.Millisecond))
 	_, err := client.Execute(context.Background(), []string{"10"}, nil)
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.ErrorContains(t, err, `rcom command "sleep" timed out after 50ms`)
 }
 
 func Test_Client_Execute_notOneCommand(t *testing.T) {
@@ -126,14 +129,30 @@ func Test_Client_addr(t *testing.T) {
 func Test_Client_retries(t *testing.T) {
 	setVar(t, &retryBaseDelay, time.Millisecond)
 
-	// statuses are the responses before the service handles the request
+	// dropConnection as status closes the connection without a response,
+	// so that the request fails like one to a restarting server
+	const dropConnection = 0
+
+	// statuses are the responses before the service handles the request,
+	// requestIDs receives the request ID of every request
+	var requestIDs []string
 	newClient := func(t *testing.T, retries int, statuses ...int) (*Client, *int) {
 		t.Helper()
 		svc := &service{allowedCMDs: map[string]bool{copyCmd(): true}}
 		var requests int
+		requestIDs = nil
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			requests++
+			requestIDs = append(requestIDs, r.Header.Get(requestIDHeader))
+			w.Header().Set(requestIDHeader, r.Header.Get(requestIDHeader))
 			if requests <= len(statuses) {
+				if statuses[requests-1] == dropConnection {
+					conn, _, err := http.NewResponseController(w).Hijack()
+					if err == nil {
+						conn.Close()
+					}
+					return
+				}
 				http.Error(w, "unavailable", statuses[requests-1])
 				return
 			}
@@ -152,20 +171,87 @@ func Test_Client_retries(t *testing.T) {
 		return err
 	}
 
-	client, requests := newClient(t, 3, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout)
+	client, requests := newClient(t, 3, http.StatusBadGateway, http.StatusServiceUnavailable)
 	require.NoError(t, execute(client), "load balancer statuses are retried")
-	assert.Equal(t, 4, *requests)
+	assert.Equal(t, 3, *requests)
+	_, err := golog.ParseUUID(requestIDs[0])
+	assert.NoError(t, err, "the client creates a request ID")
+	assert.Equal(t, []string{requestIDs[0], requestIDs[0], requestIDs[0]}, requestIDs, "one request ID for all attempts")
 
 	client, requests = newClient(t, 1, http.StatusServiceUnavailable, http.StatusServiceUnavailable)
-	err := execute(client)
+	err = execute(client)
 	responseErr, ok := errors.AsType[*ResponseError](err)
 	require.True(t, ok, "error %v is a ResponseError", err)
 	assert.Equal(t, http.StatusServiceUnavailable, responseErr.StatusCode)
+	assert.Equal(t, requestIDs[1], responseErr.RequestID)
 	assert.Equal(t, 2, *requests, "one retry")
 
 	client, requests = newClient(t, 3, http.StatusInternalServerError)
 	assert.Error(t, execute(client))
 	assert.Equal(t, 1, *requests, "a failed command is not retried")
+
+	client, requests = newClient(t, 3, http.StatusGatewayTimeout)
+	assert.Error(t, execute(client))
+	assert.Equal(t, 1, *requests, "the server can still be executing the command")
+
+	client, requests = newClient(t, 3, http.StatusOK)
+	assert.Error(t, execute(client), "the error message is not a result")
+	assert.Equal(t, 1, *requests, "an invalid result is not retried")
+
+	client, requests = newClient(t, 1, dropConnection)
+	require.NoError(t, execute(client), "a request without a response is retried")
+	assert.Equal(t, 2, *requests)
+
+	t.Run("timeout ends the delay before a retry", func(t *testing.T) {
+		setVar(t, &retryBaseDelay, time.Minute)
+		client, requests := newClient(t, 3, http.StatusServiceUnavailable)
+		ClientWithTimeout(100 * time.Millisecond)(client)
+
+		executed := make(chan error, 1)
+		go func() { executed <- execute(client) }()
+		select {
+		case err := <-executed:
+			assert.ErrorIs(t, err, context.DeadlineExceeded)
+			_, ok := errors.AsType[*ResponseError](err)
+			assert.True(t, ok, "error %v contains the error of the last attempt", err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("still waiting to retry after the timeout of the client")
+		}
+		assert.Equal(t, 1, *requests)
+	})
+}
+
+func Test_isRetryable(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	noResponse := &transportError{err: errors.New("connection refused")}
+	for name, tc := range map[string]struct {
+		ctx       context.Context
+		err       error
+		retryable bool
+	}{
+		"no response":            {context.Background(), noResponse, true},
+		"wrapped no response":    {context.Background(), fmt.Errorf("x: %w", noResponse), true},
+		"bad gateway":            {context.Background(), &ResponseError{StatusCode: http.StatusBadGateway}, true},
+		"service unavailable":    {context.Background(), &ResponseError{StatusCode: http.StatusServiceUnavailable}, true},
+		"gateway timeout":        {context.Background(), &ResponseError{StatusCode: http.StatusGatewayTimeout}, false},
+		"failed command":         {context.Background(), &ResponseError{StatusCode: http.StatusInternalServerError}, false},
+		"invalid command":        {context.Background(), &ResponseError{StatusCode: http.StatusBadRequest}, false},
+		"invalid result":         {context.Background(), errors.New("rcom.Result: unexpected EOF"), false},
+		"context ended":          {canceled, noResponse, false},
+		"context ended with 503": {canceled, &ResponseError{StatusCode: http.StatusServiceUnavailable}, false},
+	} {
+		assert.Equal(t, tc.retryable, isRetryable(tc.ctx, tc.err), name)
+	}
+}
+
+func Test_retryDelay(t *testing.T) {
+	setVar(t, &retryBaseDelay, time.Second)
+	for range 100 {
+		delay := retryDelay(4) // Fibonacci number 3
+		assert.GreaterOrEqual(t, delay, 1500*time.Millisecond)
+		assert.LessOrEqual(t, delay, 3*time.Second)
+	}
 }
 
 func Test_fibonacci(t *testing.T) {
