@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"path"
+	"path/filepath"
 	"strings"
 )
 
@@ -73,8 +74,9 @@ type Command struct {
 //     or its value contains NUL
 //   - Any result file pattern is empty, duplicated or malformed
 func (c *Command) Validate() error {
-	if c.Name == "" {
-		return errors.New("rcom.Command: no command name provided")
+	err := validateCommandName(c.Name)
+	if err != nil {
+		return err
 	}
 	for fileName := range c.Files {
 		err := validateFileName(fileName)
@@ -132,4 +134,17 @@ func (c *Command) String() string {
 		return c.Name
 	}
 	return c.Name + " " + strings.Join(c.Args, " ")
+}
+
+// validateCommandName returns an error for an empty name or a relative
+// path, which would be resolved in the working directory of the command
+// that contains its input files
+func validateCommandName(name string) error {
+	if name == "" {
+		return errors.New("rcom.Command: no command name provided")
+	}
+	if filepath.Base(name) != name && !filepath.IsAbs(name) {
+		return fmt.Errorf("rcom.Command: command %q is neither a name in the PATH nor an absolute path", limitString(name, maxErrorStringLength))
+	}
+	return nil
 }

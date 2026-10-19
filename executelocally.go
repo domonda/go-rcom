@@ -91,6 +91,10 @@ func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.
 		stdin = bytes.NewReader(c.Stdin)
 	}
 
+	// Only these fields are used after the command started,
+	// so that the input files of c can be freed while it runs
+	name, nonErrorExitCodes, resultFilePatterns := c.Name, c.NonErrorExitCodes, c.ResultFilePatterns
+
 	r, err := exec.Command(c.Name, c.Args...).
 		WithDir(dirPath).
 		WithEnv(commandEnv(c.Env)).
@@ -103,16 +107,16 @@ func ExecuteLocally(ctx context.Context, c *Command) (result *Result, callID uu.
 		return nil, callID, err
 	}
 
-	if r.ExitCode != 0 && !c.NonErrorExitCodes[r.ExitCode] {
+	if r.ExitCode != 0 && !nonErrorExitCodes[r.ExitCode] {
 		exit := fmt.Sprintf("exited with code %d", r.ExitCode)
 		if r.ExitCode < 0 {
 			// Ended by a signal, for example "signal: killed"
 			exit = "ended by " + r.ExitState
 		}
-		return nil, callID, fmt.Errorf("command %q %s\nCommand output: %s", c.Name, exit, outputTail(r.Output))
+		return nil, callID, fmt.Errorf("command %q %s\nCommand output: %s", name, exit, outputTail(r.Output))
 	}
 
-	files, err := readResultFiles(ctx, root, c.ResultFilePatterns, MaxResultFilesSize)
+	files, err := readResultFiles(ctx, root, resultFilePatterns, MaxResultFilesSize)
 	if err != nil {
 		return nil, callID, fmt.Errorf("can't read result files: %w", err)
 	}
@@ -141,6 +145,11 @@ const (
 	// maxErrorOutputSize is how many bytes of the output
 	// of a failed command its error contains
 	maxErrorOutputSize = 64 << 10
+
+	// maxReadSizeHint is the maximum buffer size that readLimited
+	// allocates before reading, so that the size of a sparse file
+	// doesn't allocate more at once
+	maxReadSizeHint = 1 << 30
 )
 
 // commandEnv returns the process environment with only the InheritedEnvVars,
@@ -206,8 +215,9 @@ func writeNewFile(ctx context.Context, root *os.Root, name string, data []byte) 
 // or all regular files if no patterns are passed.
 // Directories, symlinks, other special files and hard links
 // to files outside of root are skipped.
-// An error is returned if the files are larger than
-// maxSize bytes together and maxSize is greater than zero.
+// An error is returned for more than maxWireFiles files,
+// or if the files are larger than maxSize bytes together
+// and maxSize is greater than zero.
 func readResultFiles(ctx context.Context, root *os.Root, patterns []string, maxSize int64) (map[string][]byte, error) {
 	dir, err := root.Open(".")
 	if err != nil {
@@ -223,10 +233,14 @@ func readResultFiles(ctx context.Context, root *os.Root, patterns []string, maxS
 	var names []string
 	linksInRoot := make(map[fileID]uint64)
 	for _, entry := range entries {
+		err = ctx.Err()
+		if err != nil {
+			return nil, err
+		}
 		if !entry.Type().IsRegular() {
 			continue
 		}
-		file, err := openRegularFile(root, entry.Name())
+		file, _, err := openRegularFile(root, entry.Name())
 		if err != nil {
 			return nil, err
 		}
@@ -243,11 +257,14 @@ func readResultFiles(ctx context.Context, root *os.Root, patterns []string, maxS
 			return nil, err
 		}
 		if match {
+			if len(names) == maxWireFiles {
+				return nil, fmt.Errorf("more than %d result files", maxWireFiles)
+			}
 			names = append(names, entry.Name())
 		}
 	}
 
-	files := make(map[string][]byte)
+	files := make(map[string][]byte, len(names))
 	var size int64
 	for _, name := range names {
 		data, err := readResultFile(ctx, root, name, linksInRoot, maxSize, size)
@@ -268,7 +285,7 @@ func readResultFiles(ctx context.Context, root *os.Root, patterns []string, maxS
 // links outside of root, and an error if the file would make the
 // result files larger than maxSize, unless maxSize is zero or negative.
 func readResultFile(ctx context.Context, root *os.Root, name string, linksInRoot map[fileID]uint64, maxSize, size int64) ([]byte, error) {
-	file, err := openRegularFile(root, name)
+	file, info, err := openRegularFile(root, name)
 	if err != nil || file == nil {
 		return nil, err
 	}
@@ -286,7 +303,7 @@ func readResultFile(ctx context.Context, root *os.Root, name string, linksInRoot
 	if maxSize > 0 {
 		limit = maxSize - size
 	}
-	data, err := readLimited(&contextReader{ctx: ctx, r: file}, limit)
+	data, err := readLimited(&contextReader{ctx: ctx, r: file}, info.Size(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -298,50 +315,53 @@ func readResultFile(ctx context.Context, root *os.Root, name string, linksInRoot
 
 // openRegularFile opens the named file in root without blocking on
 // a FIFO and returns nil if it is not a regular file
-func openRegularFile(root *os.Root, name string) (*os.File, error) {
+func openRegularFile(root *os.Root, name string) (*os.File, os.FileInfo, error) {
 	file, err := root.OpenFile(name, os.O_RDONLY|openNonBlock, 0)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
-		return nil, err
+		return nil, nil, err
 	}
 	if !info.Mode().IsRegular() {
 		file.Close()
-		return nil, nil
+		return nil, nil, nil
 	}
-	return file, nil
+	return file, info, nil
 }
 
-// readLimited reads r and returns nil data if it is
-// longer than limit bytes, unless limit is negative
-func readLimited(r io.Reader, limit int64) ([]byte, error) {
-	if limit < 0 {
-		data, err := io.ReadAll(r)
+// readLimited reads r, which is expected to have size bytes,
+// into a buffer of that size, at most maxReadSizeHint, so that
+// a large file is not copied while the buffer grows. It returns
+// nil data if r is longer than limit bytes, unless limit is negative.
+func readLimited(r io.Reader, size, limit int64) ([]byte, error) {
+	if limit >= 0 {
+		if size > limit {
+			return nil, nil
+		}
+		r = io.LimitReader(r, limit+1)
+	}
+	// One more byte to read the end without growing the buffer
+	data := make([]byte, 0, min(max(size, 0), maxReadSizeHint)+1)
+	for {
+		if len(data) == cap(data) {
+			data = append(data, 0)[:len(data)]
+		}
+		n, err := r.Read(data[len(data):cap(data)])
+		data = data[:len(data)+n]
+		if err == io.EOF {
+			break
+		}
 		if err != nil {
 			return nil, err
 		}
-		return nonNil(data), nil
 	}
-	data, err := io.ReadAll(io.LimitReader(r, limit+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > limit {
+	if limit >= 0 && int64(len(data)) > limit {
 		return nil, nil
 	}
-	return nonNil(data), nil
-}
-
-// nonNil returns an empty slice for nil,
-// so that nil can mean too large in readLimited
-func nonNil(data []byte) []byte {
-	if data == nil {
-		return []byte{}
-	}
-	return data
+	return data, nil
 }
 
 // contextReader returns the error of ctx when it ends

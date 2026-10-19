@@ -2,9 +2,11 @@ package rcom
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,4 +115,52 @@ func Test_ExecuteLocally_fileNamesDifferingInCase(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("upper"), result.Files["A.txt"])
 	assert.Equal(t, []byte("lower"), result.Files["a.txt"])
+}
+
+func Test_readResultFiles_maxWireFiles(t *testing.T) {
+	dir := t.TempDir()
+	for i := range maxWireFiles + 1 {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, fmt.Sprintf("%05d.txt", i)), nil, 0o600))
+	}
+	root, err := os.OpenRoot(dir)
+	require.NoError(t, err)
+	defer root.Close()
+
+	// The client would reject a result with more files
+	_, err = readResultFiles(t.Context(), root, []string{"*.txt"}, 0)
+	assert.ErrorContains(t, err, fmt.Sprintf("more than %d result files", maxWireFiles))
+
+	// No file matches, so only the check of the context stops it
+	// from opening every file for its hard links
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = readResultFiles(ctx, root, []string{"none"}, 0)
+	assert.ErrorIs(t, err, context.Canceled)
+
+	files, err := readResultFiles(t.Context(), root, []string{"0*.txt"}, 0)
+	require.NoError(t, err)
+	assert.Len(t, files, maxWireFiles)
+}
+
+func Test_readLimited(t *testing.T) {
+	for name, tc := range map[string]struct {
+		data     string
+		size     int64 // Expected size, can differ from the data
+		limit    int64
+		expected []byte
+	}{
+		"empty":                   {"", 0, -1, []byte{}},
+		"no limit":                {"abc", 3, -1, []byte("abc")},
+		"larger than expected":    {"abcdef", 2, -1, []byte("abcdef")},
+		"smaller than expected":   {"ab", 10, -1, []byte("ab")},
+		"at the limit":            {"abc", 3, 3, []byte("abc")},
+		"over the limit":          {"abcd", 4, 3, nil},
+		"expected over the limit": {"ab", 4, 3, nil},
+		"grew over the limit":     {"abcd", 2, 3, nil},
+		"sparse file":             {"ab", 1 << 50, -1, []byte("ab")},
+	} {
+		data, err := readLimited(strings.NewReader(tc.data), tc.size, tc.limit)
+		require.NoError(t, err, name)
+		assert.Equal(t, tc.expected, data, name)
+	}
 }

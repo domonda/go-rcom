@@ -37,7 +37,7 @@ func Test_ExecuteLocally_errorOutputTail(t *testing.T) {
 func Test_ExecuteLocally_MaxResultFilesSize(t *testing.T) {
 	setVar(t, &MaxResultFilesSize, 10)
 
-	command, _ := cpCommand() // Copies a 14 byte file
+	command, expectedFile := cpCommand() // Copies a 14 byte file
 	_, _, err := ExecuteLocally(context.Background(), command)
 	assert.ErrorContains(t, err, "result files larger than 10 bytes")
 
@@ -45,6 +45,14 @@ func Test_ExecuteLocally_MaxResultFilesSize(t *testing.T) {
 	result, _, err := ExecuteLocally(context.Background(), command)
 	require.NoError(t, err, "input and output file are 28 bytes")
 	assert.Len(t, result.Files, 2)
+
+	// Zero or a negative value means no limit
+	for _, maxSize := range []int64{0, -1} {
+		setVar(t, &MaxResultFilesSize, maxSize)
+		result, _, err := ExecuteLocally(context.Background(), command)
+		require.NoError(t, err, "MaxResultFilesSize %d", maxSize)
+		assert.Equal(t, expectedFile.FileData, result.Files[expectedFile.Name()], "MaxResultFilesSize %d", maxSize)
+	}
 }
 
 func Test_ExecuteLocally_hardLinks(t *testing.T) {

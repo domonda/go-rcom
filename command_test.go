@@ -5,10 +5,12 @@ import (
 	"bytes"
 	"context"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/ungerik/go-fs"
 )
 
@@ -114,4 +116,13 @@ func Test_Command_Validate(t *testing.T) {
 	assert.NoError(t, (&Command{Name: copyCmd(), Env: map[string]string{"A": "a=b"}}).Validate())
 
 	assert.Error(t, (&Command{}).Validate(), "no command name")
+
+	// A relative path would be resolved in the working directory
+	// that contains the input files
+	for _, name := range []string{"./tool", "bin/tool", "tool/"} {
+		assert.ErrorContains(t, (&Command{Name: name}).Validate(), "nor an absolute path", name)
+	}
+	absolute, err := filepath.Abs("tool")
+	require.NoError(t, err)
+	assert.NoError(t, (&Command{Name: absolute}).Validate(), "absolute path")
 }
