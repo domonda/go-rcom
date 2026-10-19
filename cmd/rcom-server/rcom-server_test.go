@@ -1,6 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"io"
+	"net"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -30,4 +36,30 @@ func Test_parseArgs(t *testing.T) {
 func Test_checkCommands(t *testing.T) {
 	assert.NoError(t, checkCommands([]string{"go"}))
 	assert.Error(t, checkCommands([]string{"go", "rcom-command-that-does-not-exist"}))
+
+	goPath, err := exec.LookPath("go")
+	require.NoError(t, err)
+	absGoPath, err := filepath.Abs(goPath)
+	require.NoError(t, err)
+	assert.NoError(t, checkCommands([]string{absGoPath}), "absolute path")
+
+	// The server would run a relative path in the working directory
+	// of the command, where the client puts its input files
+	for _, cmd := range []string{"./go", "bin/go"} {
+		assert.ErrorContains(t, checkCommands([]string{cmd}), "nor an absolute path", cmd)
+	}
+}
+
+func Test_run(t *testing.T) {
+	var stderr bytes.Buffer
+	assert.Equal(t, 2, run(nil, "", &stderr), "missing arguments")
+	assert.Contains(t, stderr.String(), "usage: rcom-server PORT ALLOWED_COMMAND...")
+
+	assert.Equal(t, 1, run([]string{"0", "rcom-command-that-does-not-exist"}, "", io.Discard), "command not found")
+
+	listener, err := net.Listen("tcp", ":0")
+	require.NoError(t, err)
+	defer listener.Close()
+	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	assert.Equal(t, 1, run([]string{port, "go"}, "", io.Discard), "port in use")
 }
